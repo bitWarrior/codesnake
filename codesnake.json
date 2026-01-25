@@ -1,0 +1,17 @@
+{
+  "max_function_length": 40,
+  "max_function_params": 5,
+  "max_complexity": 8,
+  "max_class_methods": 15,
+  "max_instance_vars": 8,
+  "check_security": true,
+  "check_bugs": true,
+  "check_exceptions": true,
+  "check_complexity": true,
+  "check_performance": true,
+  "check_imports": true,
+  "check_style": true,
+  "report_errors": true,
+  "report_warnings": true,
+  "report_info": false
+}
