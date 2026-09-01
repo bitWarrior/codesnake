@@ -6,6 +6,7 @@ Run with: python test/test_codesnake.py
 🐍 Testing CodeSnake's bite!
 """
 
+import contextlib
 import json
 import sys
 import tempfile
@@ -2450,25 +2451,42 @@ class TestReportFormatting(unittest.TestCase):
         self.assertIn(',endColumn=10,', out)
         self.assertIn('title=SEC003 security', out)
 
+    @contextlib.contextmanager
+    def _workspace(self):
+        """Yield (cwd, a directory outside it).
+
+        Two sibling temp directories are mutually outside each other, so this
+        holds wherever the suite is run from -- including from the system temp
+        directory, where a lone TemporaryDirectory would sit *inside* the cwd.
+        """
+        import os
+        with tempfile.TemporaryDirectory() as inside_dir, \
+                tempfile.TemporaryDirectory() as outside_dir:
+            old_cwd = os.getcwd()
+            os.chdir(inside_dir)
+            try:
+                yield Path(os.getcwd()).resolve(), Path(outside_dir).resolve()
+            finally:
+                os.chdir(old_cwd)
+
     def test_github_paths_are_workspace_relative(self):
         from codesnake import format_github_report
         from codesnake.checker import _gh_escape_property
-        cwd = Path.cwd().resolve()
-        inside = cwd / 'src' / 'codesnake' / 'checker.py'
-        out = format_github_report([self._issue(filename=str(inside))])
-        self.assertIn('file=src/codesnake/checker.py,', out)
-        with tempfile.TemporaryDirectory() as tmp:
-            outside = Path(tmp).resolve() / 'x.py'
+        with self._workspace() as (workspace, elsewhere):
+            inside = workspace / 'src' / 'pkg' / 'mod.py'
+            out = format_github_report([self._issue(filename=str(inside))])
+            self.assertIn('file=src/pkg/mod.py,', out)
+            outside = elsewhere / 'x.py'
             out = format_github_report([self._issue(filename=str(outside))])
-        self.assertIn(f'file={_gh_escape_property(outside.as_posix())},', out)
+            self.assertIn(f'file={_gh_escape_property(outside.as_posix())},', out)
 
     def test_sarif_metadata_and_uris(self):
         from codesnake import format_sarif_report
-        with tempfile.TemporaryDirectory() as tmp:
-            outside = Path(tmp).resolve() / 'x.py'
+        with self._workspace() as (workspace, elsewhere):
+            outside = elsewhere / 'x.py'
             outside.write_text('x = 1\n', encoding='utf-8')
             sarif = json.loads(format_sarif_report([
-                self._issue(filename='src/codesnake/checker.py'),
+                self._issue(filename=str(workspace / 'src' / 'pkg' / 'mod.py')),
                 self._issue(filename=str(outside), code='BUG001', severity='error',
                             category='bugs'),
             ], '9.9'))
@@ -2481,7 +2499,7 @@ class TestReportFormatting(unittest.TestCase):
         self.assertIn('fullDescription', rules['BUG001'])
         uris = [r['locations'][0]['physicalLocation']['artifactLocation']['uri']
                 for r in sarif['runs'][0]['results']]
-        self.assertEqual(uris[0], 'src/codesnake/checker.py')
+        self.assertEqual(uris[0], 'src/pkg/mod.py')
         self.assertTrue(uris[1].startswith('file:///'), uris[1])
 
 
