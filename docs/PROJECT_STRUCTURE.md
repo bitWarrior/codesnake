@@ -26,7 +26,10 @@ codesnake/
 ├── examples/
 │   └── strict.codesnake.json     Stricter thresholds sample
 │
-├── docs/                         Supplementary guides
+├── docs/
+│   ├── INTEGRATIONS.md           pre-commit, CI, editors, baselines, adopting on a codebase
+│   ├── BASH_SCRIPTS_GUIDE.md     The launcher scripts and the venv
+│   └── PROJECT_STRUCTURE.md      This file
 └── .github/workflows/ci.yml      Tests on 3.10–3.13 + self-check
 ```
 

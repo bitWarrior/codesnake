@@ -146,9 +146,9 @@ echo -e "  Edit ${YELLOW}.codesnake.json${NC} to customize behavior"
 echo
 
 echo -e "${CYAN}Documentation:${NC}"
-echo "  • docs/README.md        - Full documentation"
-echo "  • docs/QUICKSTART.md    - Quick start guide"
-echo "  • docs/BANNER_GUIDE.md  - Banner customization"
+echo "  • README.md                  - Usage, rules, configuration"
+echo "  • docs/INTEGRATIONS.md       - pre-commit, CI, editor setup"
+echo "  • docs/BASH_SCRIPTS_GUIDE.md - These scripts and the venv"
 echo
 
 echo -e "${GREEN}Happy coding! 🐍✨${NC}"

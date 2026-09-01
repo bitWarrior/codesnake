@@ -251,11 +251,17 @@ codesnake/
 │   └── banner.py
 ├── test/                     # unittest suite + fixture
 ├── examples/                 # strict.codesnake.json
-├── docs/                     # extra guides
+├── docs/                     # INTEGRATIONS, BASH_SCRIPTS_GUIDE, PROJECT_STRUCTURE
 └── .github/workflows/ci.yml
 ```
 
 Releasing: bump `__version__` in `src/codesnake/_version.py`; `pyproject.toml` reads it dynamically.
+
+## Further reading
+
+- [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md) — pre-commit hooks, GitHub Actions (annotations, SARIF upload, baselines), VS Code, Makefile, adopting CodeSnake on an existing codebase, and how it overlaps with flake8/Bandit/pylint.
+- [`docs/BASH_SCRIPTS_GUIDE.md`](docs/BASH_SCRIPTS_GUIDE.md) — `setup.sh`, `codesnake.sh`, and `codesnake-launcher.sh`, and the virtual environment they manage.
+- [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md) — module map, how to add a rule, how to release.
 
 ## License
 
