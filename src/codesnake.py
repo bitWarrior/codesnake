@@ -33,6 +33,7 @@ CATEGORY_FLAGS = {
     'imports': 'check_imports',
     'style': 'check_style',
     'unused': 'check_unused',
+    'reliability': 'check_reliability',
 }
 
 # Always surface these even when report_errors is false (fail closed).
@@ -99,6 +100,25 @@ REQUEST_TAINT_ATTRS = frozenset({
     'values', 'query_params', 'query', 'params', 'body', 'files',
 })
 
+# REQUEST_TAINT_ATTRS only count when read from something that looks like an
+# HTTP request object (``request.args``, ``req.json``, ``self.request.GET``).
+REQUEST_RECEIVER_NAMES = frozenset({'request', 'req', 'flask_request', 'http_request'})
+
+# Calls that neutralize their input for the sinks we check (shell / eval).
+SANITIZER_NAMES = frozenset({
+    'int', 'float', 'bool', 'len',
+    'builtins.int', 'builtins.float', 'builtins.bool', 'builtins.len',
+    'shlex.quote', 'shlex.join',
+    're.escape', 'html.escape',
+    'urllib.parse.quote', 'urllib.parse.quote_plus',
+})
+
+# Wrappers that take ownership of a file handle's lifetime.
+HANDLE_OWNER_NAMES = frozenset({'contextlib.closing'})
+HANDLE_OWNER_METHODS = frozenset({'enter_context', 'enter_async_context'})
+
+_TEST_FILE_DIRS = frozenset({'test', 'tests', 'testing'})
+
 ABSTRACT_DECORATORS = frozenset({
     'abstractmethod',
     'abc.abstractmethod',
@@ -151,6 +171,16 @@ _CODING_COOKIE_RE = re.compile(
     re.IGNORECASE,
 )
 _TYPE_CHECKING_NAMES = frozenset({'TYPE_CHECKING', 'typing.TYPE_CHECKING'})
+
+
+# Binding kinds that participate in VAR003 shadow detection.
+_SHADOW_CHECKED_KINDS = frozenset({
+    'assign', 'arg', 'vararg', 'function', 'decorated_function',
+    'loop', 'unpack', 'annotation',
+})
+# Binding kinds reported as unused locals (VAR001). Loop targets, tuple
+# unpacking, bare annotations, and decorated nested functions are exempt.
+_REPORTED_LOCAL_KINDS = frozenset({'assign', 'function', 'class'})
 
 
 class ConfigError(Exception):
@@ -372,6 +402,7 @@ class CheckerConfig:
     check_imports: bool = True
     check_style: bool = True
     check_unused: bool = True
+    check_reliability: bool = True
     use_bandit: bool = False
     report_errors: bool = True
     report_warnings: bool = True
@@ -480,6 +511,9 @@ class SemanticChecker(ast.NodeVisitor):
         self.scopes: List[_Scope] = []
         self._in_type_checking = False
         self._with_expr_ids: Set[int] = set()
+        # id(Name node) -> binding kind for stores that are not plain assignments
+        # (loop targets, tuple unpacking, bare annotations).
+        self._store_kinds: Dict[int, str] = {}
         # Function bodies are analyzed after the enclosing scope is fully bound,
         # so closures may reference names assigned later in that scope.
         self._deferred: List[Tuple[ast.AST, List[_Scope], bool]] = []
@@ -582,7 +616,7 @@ class SemanticChecker(ast.NodeVisitor):
         if name in scope.nonlocal_names:
             return
         if name not in scope.bindings:
-            if kind in ('assign', 'arg', 'function') and scope.kind == 'function':
+            if kind in _SHADOW_CHECKED_KINDS and scope.kind == 'function':
                 self._maybe_shadow(name, node)
             scope.bindings[name] = _Binding(
                 name,
@@ -677,6 +711,8 @@ class SemanticChecker(ast.NodeVisitor):
             resolved = self._resolve_name(node.func)
             if resolved in TAINT_CALL_NAMES:
                 return True
+            if resolved in SANITIZER_NAMES:
+                return False
             if isinstance(node.func, ast.Attribute) and node.func.attr in ('get', 'format'):
                 if self._is_tainted_expr(node.func.value):
                     return True
@@ -687,7 +723,7 @@ class SemanticChecker(ast.NodeVisitor):
             resolved = self._resolve_name(node)
             if resolved in TAINT_ATTR_NAMES:
                 return True
-            if node.attr in REQUEST_TAINT_ATTRS:
+            if node.attr in REQUEST_TAINT_ATTRS and self._is_request_like(node.value):
                 return True
             return self._is_tainted_expr(node.value)
         if isinstance(node, ast.Subscript):
@@ -696,6 +732,14 @@ class SemanticChecker(ast.NodeVisitor):
             return self._is_tainted_expr(node.value)
         if isinstance(node, (ast.List, ast.Tuple)):
             return any(self._is_tainted_expr(elt) for elt in node.elts)
+        return False
+
+    @staticmethod
+    def _is_request_like(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in REQUEST_RECEIVER_NAMES
+        if isinstance(node, ast.Attribute):
+            return node.attr in REQUEST_RECEIVER_NAMES
         return False
 
     def _is_literal_expr(self, node: Optional[ast.AST]) -> bool:
@@ -759,7 +803,7 @@ class SemanticChecker(ast.NodeVisitor):
                     binding.col,
                     'VAR002',
                 )
-            elif binding.kind in ('assign', 'function', 'class'):
+            elif binding.kind in _REPORTED_LOCAL_KINDS:
                 label = 'nested function' if binding.kind == 'function' else (
                     'nested class' if binding.kind == 'class' else 'local variable'
                 )
@@ -771,6 +815,23 @@ class SemanticChecker(ast.NodeVisitor):
                     binding.col,
                     'VAR001',
                 )
+
+    def _mark_store_kind(self, target: ast.AST, kind: str) -> None:
+        """Tag every Name inside ``target`` so visit_Name binds it as ``kind``."""
+        if isinstance(target, ast.Name):
+            self._store_kinds[id(target)] = kind
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._mark_store_kind(elt, kind)
+        elif isinstance(target, ast.Starred):
+            self._mark_store_kind(target.value, kind)
+
+    def _is_test_file(self) -> bool:
+        path = Path(self.filename)
+        name = path.name
+        if name.startswith('test_') or name.endswith('_test.py') or name == 'conftest.py':
+            return True
+        return any(part in _TEST_FILE_DIRS for part in path.parts[:-1])
 
     def _is_ignored(self, issue: Issue) -> bool:
         if issue.line <= 0 or issue.line > len(self.source_lines):
@@ -931,9 +992,10 @@ class SemanticChecker(ast.NodeVisitor):
             if keyword.arg != name:
                 continue
             value = keyword.value
-            if isinstance(value, ast.Constant) and value.value is True:
+            # Identity on purpose: 1 == True but ``shell=1`` is not what we match.
+            if isinstance(value, ast.Constant) and value.value is True:  # noqa: STYLE001
                 return True
-            if isinstance(value, ast.Name) and self._lookup_const(value.id) is True:
+            if isinstance(value, ast.Name) and self._lookup_const(value.id) is True:  # noqa: STYLE001
                 return True
         return False
 
@@ -1029,6 +1091,12 @@ class SemanticChecker(ast.NodeVisitor):
                     'SEC003',
                 )
 
+        if resolved in HANDLE_OWNER_NAMES or (
+            isinstance(node.func, ast.Attribute) and node.func.attr in HANDLE_OWNER_METHODS
+        ):
+            for arg in node.args:
+                self._with_expr_ids.add(id(arg))
+
         if resolved in OPEN_NAMES and id(node) not in self._with_expr_ids:
             self.add_issue(
                 'warning',
@@ -1040,15 +1108,22 @@ class SemanticChecker(ast.NodeVisitor):
 
         self.generic_visit(node)
 
-    def visit_With(self, node: ast.With):
-        for item in node.items:
-            self._with_expr_ids.add(id(item.context_expr))
+    def _enter_with(self, node: ast.AST) -> None:
+        for item in node.items:  # type: ignore[attr-defined]
+            # Any open() anywhere in the context expression (including inside
+            # closing(...) or a helper) is owned by the with statement.
+            for sub in ast.walk(item.context_expr):
+                if isinstance(sub, ast.Call):
+                    self._with_expr_ids.add(id(sub))
+            if item.optional_vars is not None:
+                self._mark_store_kind(item.optional_vars, 'unpack')
         self.generic_visit(node)
 
+    def visit_With(self, node: ast.With):
+        self._enter_with(node)
+
     def visit_AsyncWith(self, node: ast.AsyncWith):
-        for item in node.items:
-            self._with_expr_ids.add(id(item.context_expr))
-        self.generic_visit(node)
+        self._enter_with(node)
 
     def visit_Dict(self, node: ast.Dict):
         seen: Dict[Any, ast.AST] = {}
@@ -1072,7 +1147,10 @@ class SemanticChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Assert(self, node: ast.Assert):
-        """Check assert statements."""
+        """Check assert statements (skipped in test files, where assert is the API)."""
+        if self._is_test_file():
+            self.generic_visit(node)
+            return
         self.add_issue(
             'info',
             'reliability',
@@ -1085,11 +1163,11 @@ class SemanticChecker(ast.NodeVisitor):
     # Function / lambda analysis (shared)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        self._bind(node.name, node, 'function')
+        self._bind(node.name, node, self._function_kind(node))
         self._check_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        self._bind(node.name, node, 'function')
+        self._bind(node.name, node, self._function_kind(node))
         if not self._is_abstract(node) and not self._is_stub_body(node):
             if not self._async_body_has_await(node):
                 self.add_issue(
@@ -1100,6 +1178,11 @@ class SemanticChecker(ast.NodeVisitor):
                     'ASY001',
                 )
         self._check_function(node)
+
+    @staticmethod
+    def _function_kind(node: ast.AST) -> str:
+        # A decorator (route registration, signal hook, ...) is a use.
+        return 'decorated_function' if getattr(node, 'decorator_list', None) else 'function'
 
     def visit_Lambda(self, node: ast.Lambda):
         self._check_function(node, is_lambda=True)
@@ -1210,13 +1293,23 @@ class SemanticChecker(ast.NodeVisitor):
         self.current_function = name
         args = node.args  # type: ignore[attr-defined]
 
-        self._push_scope('function', name)
+        scope = self._push_scope('function', name)
         for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
             self._bind(arg.arg, arg, 'arg')
+        # *args / **kwargs usually exist for signature compatibility.
         if args.vararg is not None:
-            self._bind(args.vararg.arg, args.vararg, 'arg')
+            self._bind(args.vararg.arg, args.vararg, 'vararg')
         if args.kwarg is not None:
-            self._bind(args.kwarg.arg, args.kwarg, 'arg')
+            self._bind(args.kwarg.arg, args.kwarg, 'vararg')
+
+        is_lambda = isinstance(node, ast.Lambda)
+        if (
+            is_lambda  # arity is dictated by the caller
+            or (name.startswith('__') and name.endswith('__'))  # protocol methods
+            or self._is_abstract(node)
+            or (not is_lambda and self._is_stub_body(node))
+        ):
+            scope.used.update(scope.bindings)
 
         body = node.body  # type: ignore[attr-defined]
         queued = len(self._deferred)
@@ -1341,8 +1434,13 @@ class SemanticChecker(ast.NodeVisitor):
 
     # Performance Checks
 
+    def visit_AsyncFor(self, node: ast.AsyncFor):
+        self._mark_store_kind(node.target, 'loop')
+        self.generic_visit(node)
+
     def visit_For(self, node: ast.For):
         """Check for loops for performance issues."""
+        self._mark_store_kind(node.target, 'loop')
         if isinstance(node.iter, ast.Call):
             if isinstance(node.iter.func, ast.Name) and node.iter.func.id == 'range':
                 if node.iter.args and isinstance(node.iter.args[0], ast.Call):
@@ -1447,7 +1545,7 @@ class SemanticChecker(ast.NodeVisitor):
             if scope is not None:
                 # Any rebinding invalidates a previously recorded constant.
                 scope.constants.pop(node.id, None)
-            self._bind(node.id, node, 'assign')
+            self._bind(node.id, node, self._store_kinds.pop(id(node), 'assign'))
         elif isinstance(node.ctx, ast.Del):
             self._mark_used(node.id)
 
@@ -1455,6 +1553,9 @@ class SemanticChecker(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign):
         self._record_dunder_all(node)
+        for target in node.targets:
+            if isinstance(target, (ast.Tuple, ast.List)):
+                self._mark_store_kind(target, 'unpack')
         self.generic_visit(node)
         # Record after visiting targets, which clears any stale constant.
         self._record_constant_assign(node.targets, node.value)
@@ -1463,6 +1564,8 @@ class SemanticChecker(ast.NodeVisitor):
                 self._mark_tainted_target(target)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
+        if node.value is None:
+            self._mark_store_kind(node.target, 'annotation')
         self.generic_visit(node)
         if node.value is not None:
             self._record_constant_assign([node.target], node.value)
@@ -1471,6 +1574,8 @@ class SemanticChecker(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign):
         self.generic_visit(node)
+        if isinstance(node.target, ast.Name):
+            self._mark_used(node.target.id)  # ``x += 1`` reads x
         if self._is_tainted_expr(node.value):
             self._mark_tainted_target(node.target)
 
@@ -1575,6 +1680,7 @@ class SemanticChecker(ast.NodeVisitor):
             self.scopes = []
             self._in_type_checking = False
             self._with_expr_ids = set()
+            self._store_kinds = {}
             self._push_scope('module')
             self.visit(tree)
             self._run_deferred(0)
@@ -2063,9 +2169,9 @@ def format_sarif_report(issues: Sequence[Issue], tool_version: str) -> str:
 
 
 def _should_use_color(color: Optional[bool], stream: TextIO) -> bool:
-    if color is False:
+    if color is False:  # noqa: STYLE001 - tri-state Optional[bool]
         return False
-    if color is True:
+    if color is True:  # noqa: STYLE001
         return True
     if os.environ.get('NO_COLOR'):
         return False

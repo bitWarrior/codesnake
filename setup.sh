@@ -103,25 +103,7 @@ echo -e "${GREEN}✓ Scripts are executable${NC}\n"
 # Create default config if it doesn't exist
 if [ ! -f "${SCRIPT_DIR}/.codesnake.json" ]; then
     echo -e "${YELLOW}Creating default configuration file...${NC}"
-    cat > "${SCRIPT_DIR}/.codesnake.json" << 'EOF'
-{
-  "max_function_length": 50,
-  "max_function_params": 7,
-  "max_complexity": 10,
-  "max_class_methods": 20,
-  "max_instance_vars": 10,
-  "check_security": true,
-  "check_bugs": true,
-  "check_exceptions": true,
-  "check_complexity": true,
-  "check_performance": true,
-  "check_imports": true,
-  "check_style": true,
-  "report_errors": true,
-  "report_warnings": true,
-  "report_info": true
-}
-EOF
+    python3 "${SCRIPT_DIR}/src/codesnake_cli.py" config -o "${SCRIPT_DIR}/.codesnake.json" > /dev/null
     echo -e "${GREEN}✓ Created .codesnake.json${NC}\n"
 fi
 

@@ -1660,6 +1660,274 @@ class TestStagedAndLauncherRegressions(unittest.TestCase):
         self.assertIn('requires a value', completed.stderr)
 
 
+class TestUnusedNoiseReduction(unittest.TestCase):
+    """VAR001/VAR002 exemptions that match how real code is written."""
+
+    def _codes(self, code, filename='<string>', **cfg):
+        config = CheckerConfig(**cfg) if cfg else None
+        return [i.code for i in SemanticChecker(code, filename, config=config).analyze()]
+
+    def test_loop_target_not_reported(self):
+        code = """
+def f(items):
+    for i in range(3):
+        items.append(0)
+    for key, value in items:
+        items.append(value)
+"""
+        self.assertNotIn('VAR001', self._codes(code))
+
+    def test_async_loop_target_not_reported(self):
+        code = """
+async def f(stream):
+    async for chunk in stream:
+        await stream.ack()
+"""
+        self.assertNotIn('VAR001', self._codes(code))
+
+    def test_tuple_unpack_partial_use_not_reported(self):
+        code = """
+def f(pair):
+    a, b = pair
+    first, *rest = pair
+    return a, first
+"""
+        self.assertNotIn('VAR001', self._codes(code))
+
+    def test_with_target_unpack_not_reported(self):
+        code = """
+def f(cm):
+    with cm as (a, b):
+        return a
+"""
+        self.assertNotIn('VAR001', self._codes(code))
+
+    def test_bare_annotation_not_reported(self):
+        code = """
+def f():
+    x: int
+    return 1
+"""
+        self.assertNotIn('VAR001', self._codes(code))
+
+    def test_plain_assignment_still_reported(self):
+        code = """
+def f():
+    x = 1
+    y: int = 2
+    return 0
+"""
+        self.assertEqual(self._codes(code).count('VAR001'), 2)
+
+    def test_augmented_assignment_counts_as_use(self):
+        code = """
+def f(xs):
+    total = 0
+    for x in xs:
+        total += x
+"""
+        self.assertNotIn('VAR001', self._codes(code))
+
+    def test_decorated_nested_function_not_reported(self):
+        code = """
+def setup(app):
+    @app.route("/")
+    def index():
+        return "hi"
+
+    @app.errorhandler(404)
+    async def missing(err):
+        return str(err)
+"""
+        self.assertNotIn('VAR001', self._codes(code))
+
+    def test_undecorated_unused_nested_function_still_reported(self):
+        code = """
+def outer():
+    def helper():
+        return 1
+    return 2
+"""
+        self.assertEqual(self._codes(code).count('VAR001'), 1)
+
+    def test_lambda_arguments_not_reported(self):
+        code = """
+import signal
+signal.signal(signal.SIGINT, lambda sig, frame: None)
+handlers = {"k": lambda event: 0}
+"""
+        self.assertNotIn('VAR002', self._codes(code))
+
+    def test_dunder_method_arguments_not_reported(self):
+        code = """
+class Guard:
+    def __exit__(self, exc_type, exc, tb):
+        return False
+    def __setitem__(self, key, value):
+        pass
+"""
+        self.assertNotIn('VAR002', self._codes(code))
+
+    def test_star_args_not_reported(self):
+        code = """
+def handler(event, *args, **kwargs):
+    return event
+"""
+        self.assertNotIn('VAR002', self._codes(code))
+
+    def test_stub_and_abstract_arguments_not_reported(self):
+        code = """
+from abc import abstractmethod
+class Base:
+    @abstractmethod
+    def run(self, payload):
+        raise NotImplementedError
+    def hook(self, payload):
+        \"\"\"Override me.\"\"\"
+    def other(self, payload):
+        ...
+"""
+        self.assertNotIn('VAR002', self._codes(code))
+
+    def test_ordinary_unused_argument_still_reported(self):
+        code = """
+def process(record, verbose):
+    return record
+"""
+        codes = self._codes(code)
+        self.assertEqual(codes.count('VAR002'), 1)
+
+
+class TestReliabilityCategory(unittest.TestCase):
+
+    def test_assert_skipped_in_test_files(self):
+        code = "def test_x():\n    assert 1 == 1\n"
+        for name in ('test_x.py', 'x_test.py', 'conftest.py',
+                     'pkg/tests/helpers.py', 'test/fixture.py'):
+            issues = SemanticChecker(code, filename=name).analyze()
+            self.assertEqual([i.code for i in issues if i.code == 'REL002'], [], name)
+
+    def test_assert_reported_in_regular_files(self):
+        code = "def check(v):\n    assert v > 0\n"
+        issues = SemanticChecker(code, filename='pkg/validate.py').analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'REL002']), 1)
+
+    def test_check_reliability_flag_disables_rel_and_asy(self):
+        code = """
+async def never_awaits():
+    return 1
+def check(v):
+    assert v
+"""
+        config = CheckerConfig(check_reliability=False)
+        issues = SemanticChecker(code, filename='app.py', config=config).analyze()
+        self.assertEqual([i.code for i in issues if i.code in ('REL002', 'ASY001')], [])
+        default = SemanticChecker(code, filename='app.py').analyze()
+        self.assertEqual(sorted(i.code for i in default if i.code in ('REL002', 'ASY001')),
+                         ['ASY001', 'REL002'])
+
+    def test_check_reliability_in_config_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'c.json')
+            CheckerConfig(check_reliability=False).to_file(path)
+            self.assertFalse(CheckerConfig.from_file(path).check_reliability)
+            self.assertIn('check_reliability', json.loads(Path(path).read_text()))
+
+
+class TestTaintPrecision(unittest.TestCase):
+
+    def _sec(self, code, sink_code):
+        issues = SemanticChecker(code).analyze()
+        return [i for i in issues if i.code == sink_code]
+
+    def test_generic_data_attribute_not_untrusted(self):
+        code = """
+class Job:
+    def run(self):
+        return eval(self.data)
+"""
+        sec = self._sec(code, 'SEC001')
+        self.assertEqual(len(sec), 1)
+        self.assertNotIn('untrusted', sec[0].message)
+
+    def test_request_receivers_still_tainted(self):
+        for receiver in ('request.args["q"]', 'req.json["q"]', 'self.request.GET["q"]',
+                         'request.headers.get("X")', 'request.form.get("q")'):
+            code = f"def view(self, request, req):\n    eval({receiver})\n"
+            sec = self._sec(code, 'SEC001')
+            self.assertEqual(len(sec), 1, receiver)
+            self.assertEqual(sec[0].severity, 'error', receiver)
+
+    def test_shlex_quote_sanitizes_shell_command(self):
+        code = """
+import shlex, subprocess
+user = input()
+subprocess.run("ls " + shlex.quote(user), shell=True)
+"""
+        sec = self._sec(code, 'SEC003')
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'warning')
+
+    def test_int_cast_sanitizes(self):
+        code = """
+import subprocess
+user = input()
+subprocess.run(f"sleep {int(user)}", shell=True)
+"""
+        sec = self._sec(code, 'SEC003')
+        self.assertEqual(sec[0].severity, 'warning')
+
+    def test_unsanitized_wrapper_call_still_tainted(self):
+        code = """
+import subprocess
+user = input()
+subprocess.run("ls " + str(user), shell=True)
+"""
+        sec = self._sec(code, 'SEC003')
+        self.assertEqual(sec[0].severity, 'error')
+
+
+class TestResourceOwnership(unittest.TestCase):
+
+    def _res(self, code):
+        return [i for i in SemanticChecker(code).analyze() if i.code == 'RES001']
+
+    def test_closing_open_in_with_ok(self):
+        code = """
+import contextlib
+def f(p):
+    with contextlib.closing(open(p)) as fh:
+        return fh.read()
+"""
+        self.assertEqual(self._res(code), [])
+
+    def test_enter_context_open_ok(self):
+        code = """
+from contextlib import ExitStack
+def f(paths):
+    with ExitStack() as stack:
+        handles = [stack.enter_context(open(p)) for p in paths]
+        return handles
+"""
+        self.assertEqual(self._res(code), [])
+
+    def test_helper_wrapping_open_in_with_ok(self):
+        code = """
+def f(p):
+    with wrap(open(p)) as fh:
+        return fh.read()
+"""
+        self.assertEqual(self._res(code), [])
+
+    def test_bare_open_still_reported(self):
+        code = """
+def f(p):
+    fh = open(p)
+    return fh.read()
+"""
+        self.assertEqual(len(self._res(code)), 1)
+
+
 def run_tests():
     """Run all tests and print results."""
     loader = unittest.TestLoader()

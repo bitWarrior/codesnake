@@ -120,11 +120,11 @@ Missing files, empty directories, and decode failures are **IO001**. Syntax erro
 | **IMP001** | warning | `from module import *` |
 | **IMP002** | warning | Imported name is never used (module level or inside a function) |
 | **IMP003** | error | Relative import of a name the sibling module does not define |
-| **VAR001** | warning | Unused local or nested function |
-| **VAR002** | warning | Unused argument (`self` / `cls` and `_`-prefixed names are skipped) |
+| **VAR001** | warning | Unused local or nested function (loop targets, tuple unpacking, bare annotations, and decorated nested functions are exempt) |
+| **VAR002** | warning | Unused argument (`self` / `cls`, `_`-prefixed names, `*args` / `**kwargs`, lambda and dunder-method parameters, and abstract/stub bodies are skipped) |
 | **VAR003** | info | Local name shadows an enclosing function binding |
-| **REL002** | info | `assert` is stripped under `-O` |
-| **RES001** | warning | `open()` used without `with` |
+| **REL002** | info | `assert` is stripped under `-O` (skipped in `test_*.py`, `*_test.py`, `conftest.py`, and `test(s)/` directories) |
+| **RES001** | warning | `open()` used without `with` (anything inside a `with` item, `contextlib.closing(...)`, or `stack.enter_context(...)` counts as owned) |
 | **ASY001** | warning | `async def` that never `await`s (stubs and `@abstractmethod` skipped) |
 | **SYN001** | error | Syntax error |
 | **IO001** | error | File missing, not a file, unreadable, or empty directory |
@@ -134,7 +134,7 @@ Call checks resolve imports (`from subprocess import call`, `import pickle as pk
 
 Function bodies are analyzed after the enclosing scope is fully bound, so a closure that references a variable assigned *after* the `def` does not produce a false "unused variable" warning.
 
-Untrusted input (taint) is tracked from `input()`, `sys.argv`, `os.environ` / `os.getenv`, and `request.args` / `GET` / `POST`-style attributes, including f-strings, `+`, `.format()`, `.get()`, and subscripts.
+Untrusted input (taint) is tracked from `input()`, `sys.argv`, `os.environ` / `os.getenv`, and `args` / `GET` / `POST` / `json` / `form`-style attributes read from a request object (`request`, `req`, `self.request`), including f-strings, `+`, `.format()`, `.get()`, and subscripts. Passing tainted data through `shlex.quote`, `int()`, `re.escape`, `html.escape`, or `urllib.parse.quote` clears the taint.
 
 **IMP003** runs when several files are checked together. `from .foo import bar` is an error only if `foo.py` (or `foo/__init__.py`) is in the same run and does not define `bar`. Unused imports inside `if TYPE_CHECKING:` and names listed in `__all__` are not flagged as IMP002.
 
@@ -170,6 +170,7 @@ If `.codesnake.json` exists in the current directory, it is loaded automatically
   "check_imports": true,
   "check_style": true,
   "check_unused": true,
+  "check_reliability": true,
   "use_bandit": false,
   "report_errors": true,
   "report_warnings": true,
@@ -177,7 +178,7 @@ If `.codesnake.json` exists in the current directory, it is loaded automatically
 }
 ```
 
-`check_*` turns whole categories off. `report_*` filters by severity. `use_bandit` merges Bandit when it is installed. A stricter sample lives in `codesnake.json`.
+`check_*` turns whole categories off (`check_reliability` covers REL002 and ASY001). `report_*` filters by severity. `use_bandit` merges Bandit when it is installed. A stricter sample lives in `codesnake.json`.
 
 ## Library API
 

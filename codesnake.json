@@ -12,6 +12,7 @@
   "check_imports": true,
   "check_style": true,
   "check_unused": true,
+  "check_reliability": true,
   "use_bandit": false,
   "report_errors": true,
   "report_warnings": true,
