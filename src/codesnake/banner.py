@@ -4,14 +4,14 @@ CodeSnake ASCII Art and Branding
 
 from ._version import __version__
 
-def print_snake_banner():
-    """Print the colorful CodeSnake ASCII banner."""
+def print_snake_banner(use_color: bool = True):
+    """Print the CodeSnake ASCII banner, colored unless ``use_color`` is false."""
     # ANSI Color Codes
-    GREEN = "\033[92m"
-    DARK_GREEN = "\033[32m"
-    YELLOW = "\033[93m"
-    CYAN = "\033[96m"
-    RESET = "\033[0m"
+    GREEN = "\033[92m" if use_color else ""
+    DARK_GREEN = "\033[32m" if use_color else ""
+    YELLOW = "\033[93m" if use_color else ""
+    CYAN = "\033[96m" if use_color else ""
+    RESET = "\033[0m" if use_color else ""
     
     # The banner split into lines
     lines = [

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from .banner import print_snake_banner, print_version
-from .checker import CheckerConfig, run_check
+from .checker import CheckerConfig, _should_use_color, run_check
 
 OUTPUT_FORMATS = ('text', 'json', 'github', 'sarif')
 SEVERITIES = ('error', 'warning', 'info')
@@ -118,7 +118,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(normalize_argv(raw))
 
     if args.banner:
-        print_snake_banner()
+        print_snake_banner(use_color=_should_use_color(None, sys.stdout))
         return 0
 
     if args.version or args.command == 'version':
@@ -159,7 +159,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"✅ Default configuration written to {args.output}")
         return 0
 
-    print_snake_banner()
+    print_snake_banner(use_color=_should_use_color(None, sys.stdout))
     parser.print_help()
     return 0
 

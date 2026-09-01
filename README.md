@@ -186,7 +186,7 @@ check_style = false
 }
 ```
 
-`check_*` turns whole categories off (`check_reliability` covers REL002 and ASY001). `report_*` filters by severity. `use_bandit` merges Bandit when it is installed. A stricter sample lives in `examples/strict.codesnake.json`.
+`max_*` thresholds must be 1 or greater; anything lower is a config error. `check_*` turns whole categories off (`check_reliability` covers REL002 and ASY001). `report_*` filters by severity. `use_bandit` merges Bandit when it is installed. A stricter sample lives in `examples/strict.codesnake.json`.
 
 ## Library API
 

@@ -536,6 +536,11 @@ class CheckerConfig:
                     f"'{key}' must be {expected.__name__}, got {type(value).__name__}"
                 )
                 continue
+            # A threshold below 1 flags every function in the tree, which reads
+            # as a broken tool rather than a broken config.
+            if expected is int and value < 1:
+                problems.append(f"'{key}' must be 1 or greater, got {value}")
+                continue
             kwargs[key] = value
         if problems:
             raise ConfigError(f"Invalid config values in '{path}': " + '; '.join(problems))
@@ -2057,8 +2062,15 @@ def expand_python_targets(paths: Sequence[str]) -> Tuple[List[str], List[Issue]]
     seen: Set[str] = set()
 
     def _add(item: str) -> None:
-        if item not in seen:
-            seen.add(item)
+        # Explicit files keep the spelling that was passed, while directory
+        # expansion yields resolved paths, so dedupe on identity rather than
+        # on the string: 'pkg/a.py pkg/' is one file, not two.
+        try:
+            key = str(Path(item).resolve())
+        except OSError:
+            key = item
+        if key not in seen:
+            seen.add(key)
             targets.append(item)
 
     for raw in paths:
@@ -2538,8 +2550,10 @@ def run_check(
         print("Error: no files to check", file=sys.stderr)
         return 1
 
+    use_color = _should_use_color(color, out) and output_format == 'text'
+
     if show_banner and output_format == 'text':
-        print_snake_banner()
+        print_snake_banner(use_color=use_color)
 
     targets, extra_issues = expand_python_targets(file_list)
 
@@ -2621,8 +2635,6 @@ def run_check(
     ]
     all_displayed = [issue for _, issues in displayed for issue in issues]
     errors, warnings, infos = _count_by_severity(all_displayed)
-    use_color = _should_use_color(color, out) and output_format == 'text'
-
     if output_format == 'json':
         out.write(format_json_report(displayed))
     elif output_format == 'github':

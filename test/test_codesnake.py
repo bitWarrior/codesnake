@@ -826,6 +826,30 @@ class TestDirectoryWalkAndEncoding(unittest.TestCase):
             self.assertEqual(len(targets), 1)
             self.assertTrue(targets[0].endswith('mod.py'))
 
+    def test_overlapping_file_and_directory_targets_dedupe(self):
+        """'pkg/a.py pkg/' is one file: the relative spelling and the resolved
+        path the directory walk yields must not both be analyzed."""
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / 'pkg').mkdir()
+            (root / 'pkg' / 'a.py').write_text('eval(input())\n', encoding='utf-8')
+
+            old_cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                targets, _ = expand_python_targets(['pkg/a.py', 'pkg'])
+                self.assertEqual(len(targets), 1, targets)
+                targets, _ = expand_python_targets(['pkg', 'pkg/a.py'])
+                self.assertEqual(len(targets), 1, targets)
+
+                out = StringIO()
+                run_check(['pkg/a.py', 'pkg'], stream=out,
+                          color=False, show_banner=False)
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(out.getvalue().count('SEC001'), 1)
+
     def test_gitignore_skips_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1532,6 +1556,21 @@ class TestConfigValidationRegressions(unittest.TestCase):
             self.assertIn('max_complexity', str(ctx.exception))
             self.assertIn('int', str(ctx.exception))
 
+    def test_non_positive_threshold_is_config_error(self):
+        from codesnake import ConfigError
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {"max_complexity": -1, "max_function_length": 0})
+            with self.assertRaises(ConfigError) as ctx:
+                CheckerConfig.from_file(path)
+            message = str(ctx.exception)
+            self.assertIn("'max_complexity' must be 1 or greater", message)
+            self.assertIn("'max_function_length' must be 1 or greater", message)
+
+    def test_threshold_of_one_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {"max_complexity": 1})
+            self.assertEqual(CheckerConfig.from_file(path).max_complexity, 1)
+
     def test_bool_field_rejects_int(self):
         from codesnake import ConfigError
         with tempfile.TemporaryDirectory() as tmp:
@@ -2000,6 +2039,29 @@ class TestPackageAndCli(unittest.TestCase):
             out = StringIO()
             run_check([str(deep), str(healthy)], stream=out, color=False)
             self.assertIn('IMP002', out.getvalue())
+
+    def test_banner_honors_no_color(self):
+        from unittest.mock import patch
+        from codesnake.banner import print_snake_banner
+        with patch('sys.stdout', StringIO()) as plain:
+            print_snake_banner(use_color=False)
+        self.assertNotIn('\033[', plain.getvalue())
+        self.assertIn('Strikes at code problems', plain.getvalue())
+        with patch('sys.stdout', StringIO()) as colored:
+            print_snake_banner(use_color=True)
+        self.assertIn('\033[', colored.getvalue())
+
+    def test_run_check_banner_is_plain_when_color_disabled(self):
+        from unittest.mock import patch
+        from codesnake import run_check
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'a.py'
+            path.write_text('x = 1\n', encoding='utf-8')
+            # The banner goes to stdout, not to ``stream``.
+            with patch('sys.stdout', StringIO()) as banner:
+                run_check([str(path)], stream=StringIO(), color=False, show_banner=True)
+            self.assertIn('Strikes at code problems', banner.getvalue())
+            self.assertNotIn('\033[', banner.getvalue())
 
     def test_cli_config_refuses_to_clobber_without_force(self):
         from unittest.mock import patch
