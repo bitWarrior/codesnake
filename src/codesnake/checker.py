@@ -143,6 +143,8 @@ HANDLE_OWNER_METHODS = frozenset({'enter_context', 'enter_async_context'})
 
 _TEST_FILE_DIRS = frozenset({'test', 'tests', 'testing'})
 
+_BROAD_EXCEPTION_NAMES = frozenset({'Exception', 'builtins.Exception'})
+
 ABSTRACT_DECORATORS = frozenset({
     'abstractmethod',
     'abc.abstractmethod',
@@ -853,9 +855,9 @@ class SemanticChecker(ast.NodeVisitor):
             if isinstance(node.func, ast.Attribute) and node.func.attr in ('get', 'format'):
                 if self._is_tainted_expr(node.func.value):
                     return True
-                if any(self._is_tainted_expr(arg) for arg in node.args):
+                if self._call_args_tainted(node):
                     return True
-            return any(self._is_tainted_expr(arg) for arg in node.args)
+            return self._call_args_tainted(node)
         if isinstance(node, ast.Attribute):
             resolved = self._resolve_name(node)
             if resolved in TAINT_ATTR_NAMES:
@@ -870,6 +872,25 @@ class SemanticChecker(ast.NodeVisitor):
         if isinstance(node, (ast.List, ast.Tuple)):
             return any(self._is_tainted_expr(elt) for elt in node.elts)
         return False
+
+    @staticmethod
+    def _first_arg(node: ast.Call, keyword: Optional[str] = None) -> Optional[ast.AST]:
+        """The call's first argument, positional or passed by ``keyword``."""
+        if node.args:
+            first = node.args[0]
+            # ``f(*seq)`` says nothing about what lands in position 0.
+            return None if isinstance(first, ast.Starred) else first
+        if keyword:
+            for kw in node.keywords:
+                if kw.arg == keyword:
+                    return kw.value
+        return None
+
+    def _call_args_tainted(self, node: ast.Call) -> bool:
+        """Taint reaches a call through keywords as readily as positionals."""
+        if any(self._is_tainted_expr(arg) for arg in node.args):
+            return True
+        return any(self._is_tainted_expr(kw.value) for kw in node.keywords)
 
     @staticmethod
     def _is_request_like(node: ast.AST) -> bool:
@@ -977,21 +998,46 @@ class SemanticChecker(ast.NodeVisitor):
         resolved = self._resolve_name(test)
         return resolved in _TYPE_CHECKING_NAMES
 
-    def _record_dunder_all(self, node: ast.Assign) -> None:
-        if not self.scopes or self.scopes[-1].kind != 'module':
+    def _mark_exported(self, value: Optional[ast.AST]) -> None:
+        """Treat the string literals in an ``__all__`` value as module-level uses."""
+        if not isinstance(value, (ast.List, ast.Tuple, ast.Set)):
             return
-        names: List[str] = []
+        for elt in value.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                self.scopes[0].used.add(elt.value)
+
+    def _at_module_scope(self) -> bool:
+        return bool(self.scopes) and self.scopes[-1].kind == 'module'
+
+    def _record_dunder_all(self, node: ast.Assign) -> None:
+        if not self._at_module_scope():
+            return
         for target in node.targets:
             if isinstance(target, ast.Name) and target.id == '__all__':
-                value = node.value
-                elts: Sequence[ast.AST] = []
-                if isinstance(value, (ast.List, ast.Tuple)):
-                    elts = value.elts
-                for elt in elts:
-                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                        names.append(elt.value)
-        for name in names:
-            self.scopes[0].used.add(name)
+                self._mark_exported(node.value)
+
+    def _record_dunder_all_augmented(self, node: ast.AugAssign) -> None:
+        """``__all__ += [...]``, the usual way a package re-exports submodules."""
+        if not self._at_module_scope():
+            return
+        if isinstance(node.target, ast.Name) and node.target.id == '__all__':
+            self._mark_exported(node.value)
+
+    def _record_dunder_all_call(self, node: ast.Call) -> None:
+        """``__all__.extend([...])`` / ``__all__.append('name')``."""
+        if not self._at_module_scope():
+            return
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            return
+        if not isinstance(func.value, ast.Name) or func.value.id != '__all__':
+            return
+        if func.attr == 'extend' and node.args:
+            self._mark_exported(node.args[0])
+        elif func.attr == 'append':
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    self.scopes[0].used.add(arg.value)
 
     def _record_constant_assign(self, targets: Sequence[ast.AST], value: ast.AST) -> None:
         if not isinstance(value, ast.Constant):
@@ -1090,7 +1136,10 @@ class SemanticChecker(ast.NodeVisitor):
                 yield from self._iter_raises(stmt.body)
                 yield from self._iter_raises(getattr(stmt, 'orelse', []))
             elif isinstance(stmt, _TRY_NODES):
+                # A nested handler's own body is checked when visit_Try reaches
+                # that Try, so descending into it here would report twice.
                 yield from self._iter_raises(stmt.body)
+                yield from self._iter_raises(stmt.orelse)
                 yield from self._iter_raises(stmt.finalbody)
             elif isinstance(stmt, ast.Match):
                 for case in stmt.cases:
@@ -1133,11 +1182,12 @@ class SemanticChecker(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call):
         """Check for security issues in function calls."""
+        self._record_dunder_all_call(node)
         resolved = self._resolve_name(node.func)
 
         if resolved in EVAL_EXEC_NAMES:
             called = resolved.rsplit('.', 1)[-1]
-            arg0 = node.args[0] if node.args else None
+            arg0 = self._first_arg(node)
             if arg0 is not None and self._is_tainted_expr(arg0):
                 self.add_issue(
                     'error',
@@ -1201,7 +1251,7 @@ class SemanticChecker(ast.NodeVisitor):
                 )
 
         if resolved in SUBPROCESS_SHELL_NAMES:
-            cmd = node.args[0] if node.args else None
+            cmd = self._first_arg(node, 'args')
             tainted_cmd = cmd is not None and self._is_tainted_expr(cmd)
             if self._keyword_true(node, 'shell'):
                 if tainted_cmd:
@@ -1230,7 +1280,7 @@ class SemanticChecker(ast.NodeVisitor):
                 )
 
         if resolved in ALWAYS_SHELL_NAMES:
-            cmd = node.args[0] if node.args else None
+            cmd = self._first_arg(node, 'cmd')
             if cmd is not None and self._is_tainted_expr(cmd):
                 self.add_issue(
                     'error',
@@ -1283,25 +1333,50 @@ class SemanticChecker(ast.NodeVisitor):
     def visit_AsyncWith(self, node: ast.AsyncWith):
         self._enter_with(node)
 
+    _MISSING = object()
+
+    @classmethod
+    def _literal_key(cls, node: Optional[ast.AST]) -> Any:
+        """The hashable value of a literal key, or ``_MISSING`` if it is not one.
+
+        NaN is treated as non-literal: it never equals itself, so two NaN keys
+        are not a duplicate.
+        """
+        if isinstance(node, ast.Constant):
+            value = node.value
+            if isinstance(value, float) and value != value:
+                return cls._MISSING
+            if isinstance(value, (str, int, float, bool, bytes, type(None))):
+                return value
+            return cls._MISSING
+        if isinstance(node, ast.Tuple):
+            items = []
+            for elt in node.elts:
+                item = cls._literal_key(elt)
+                if item is cls._MISSING:
+                    return cls._MISSING
+                items.append(item)
+            return tuple(items)
+        return cls._MISSING
+
     def visit_Dict(self, node: ast.Dict):
         seen: Dict[Any, ast.AST] = {}
         for key in node.keys:
-            if key is None or not isinstance(key, ast.Constant):
+            if key is None:  # ``**spread``
                 continue
-            value = key.value
-            if isinstance(value, float) and value != value:
+            value = self._literal_key(key)
+            if value is self._MISSING:
                 continue
-            if isinstance(value, (str, int, float, bool, bytes, type(None))):
-                if value in seen:
-                    self.add_issue(
-                        'warning',
-                        'bugs',
-                        f"Duplicate dictionary key {value!r}",
-                        key,
-                        'BUG002',
-                    )
-                else:
-                    seen[value] = key
+            if value in seen:
+                self.add_issue(
+                    'warning',
+                    'bugs',
+                    f"Duplicate dictionary key {value!r}",
+                    key,
+                    'BUG002',
+                )
+            else:
+                seen[value] = key
         self.generic_visit(node)
 
     def visit_Assert(self, node: ast.Assert):
@@ -1538,7 +1613,7 @@ class SemanticChecker(ast.NodeVisitor):
                     handler,
                     'EXC001',
                 )
-            elif isinstance(handler.type, ast.Name) and handler.type.id == 'Exception':
+            elif self._catches_bare_exception(handler.type):
                 self.add_issue(
                     'info',
                     'exceptions',
@@ -1561,6 +1636,14 @@ class SemanticChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     visit_TryStar = visit_Try
+
+    def _catches_bare_exception(self, node: Optional[ast.AST]) -> bool:
+        """True for ``Exception``, ``builtins.Exception``, or a tuple holding one."""
+        if node is None:
+            return False
+        if isinstance(node, ast.Tuple):
+            return any(self._catches_bare_exception(elt) for elt in node.elts)
+        return self._resolve_name(node) in _BROAD_EXCEPTION_NAMES
 
     def visit_Raise(self, node: ast.Raise):
         """Check raise statements."""
@@ -1714,6 +1797,7 @@ class SemanticChecker(ast.NodeVisitor):
                 self._mark_tainted_target(node.target)
 
     def visit_AugAssign(self, node: ast.AugAssign):
+        self._record_dunder_all_augmented(node)
         self.generic_visit(node)
         if isinstance(node.target, ast.Name):
             self._mark_used(node.target.id)  # ``x += 1`` reads x
@@ -2236,8 +2320,12 @@ def collect_bandit_issues(filepaths: Sequence[str]) -> List[Issue]:
 def _read_source_line(source: Optional[str], line: int) -> str:
     if not source or line <= 0:
         return ''
-    lines = source.splitlines()
-    if line > len(lines):
+    return _source_line_from(source.splitlines(), line)
+
+
+def _source_line_from(lines: Sequence[str], line: int) -> str:
+    """``line`` (1-based) out of an already-split source, or '' when out of range."""
+    if line <= 0 or line > len(lines):
         return ''
     return lines[line - 1]
 
@@ -2650,8 +2738,10 @@ def run_check(
             any_issues = True
             out.write(f"\nAnalysis of {filepath}:\n")
             out.write(f"{'=' * 60}\n\n")
+            # Split once per file, not once per issue.
+            source_lines = source.splitlines() if source else []
             for issue in issues:
-                source_line = _read_source_line(source, issue.line)
+                source_line = _source_line_from(source_lines, issue.line)
                 rendered = format_issue(issue, source_line, use_color=use_color)
                 out.write(rendered)
                 if not rendered.endswith('\n'):

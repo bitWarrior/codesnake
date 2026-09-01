@@ -105,9 +105,9 @@ Missing files, empty directories, and decode failures are **IO001**. Syntax erro
 | **SEC003** | warning / error | `subprocess` with `shell=True`, or `os.system` / `os.popen` / `subprocess.getoutput` (**error** if the command is untrusted) |
 | **SEC004** | warning | `subprocess` command (`run`, `call`, `Popen`, `check_call`, `check_output`) built from untrusted input |
 | **BUG001** | error | Mutable default arguments (`[]`, `{}`, `set()`, `list()`, kw-only, `lambda`, `async def`) |
-| **BUG002** | warning | Duplicate key in a dict literal |
+| **BUG002** | warning | Duplicate key in a dict literal, including tuple keys |
 | **EXC001** | warning | Bare `except:` |
-| **EXC002** | info | `except Exception` |
+| **EXC002** | info | `except Exception`, including `builtins.Exception` and tuple clauses like `except (ValueError, Exception)` |
 | **EXC003** | warning | Empty `except` body (`pass`) |
 | **EXC004** | warning | `raise Exception()` with no message |
 | **EXC005** | warning | `raise NewError(...)` inside `except` / `except*` without `from` |

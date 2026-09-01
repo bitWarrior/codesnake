@@ -1926,6 +1926,101 @@ subprocess.run("ls " + str(user), shell=True)
         self.assertEqual(sec[0].severity, 'error')
 
 
+class TestFalseNegativeCoverage(unittest.TestCase):
+    """Rules that used to miss a legitimate form of the pattern."""
+
+    def _codes(self, code, wanted):
+        return [i for i in SemanticChecker(code).analyze() if i.code == wanted]
+
+    def test_taint_reaches_sink_through_keyword_argument(self):
+        issues = self._codes(
+            "import subprocess\nsubprocess.run(args=input(), shell=True)\n", 'SEC003')
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, 'error')
+        self.assertIn('untrusted', issues[0].message)
+
+    def test_taint_propagates_through_a_wrapping_call_keyword(self):
+        issues = self._codes(
+            "import subprocess\ncmd = ' '.join(sep=input())\n"
+            "subprocess.run(cmd, shell=True)\n", 'SEC003')
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, 'error')
+
+    def test_os_system_command_keyword(self):
+        issues = self._codes("import os\nos.system(cmd=input())\n", 'SEC003')
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, 'error')
+
+    def test_starred_argument_does_not_claim_position_zero(self):
+        """``run(*argv, shell=True)`` says nothing about the command; stay a warning."""
+        issues = self._codes(
+            "import subprocess\nimport sys\n"
+            "subprocess.run(*sys.argv, shell=True)\n", 'SEC003')
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, 'warning')
+
+    def test_lossy_raise_in_nested_try_else(self):
+        code = """
+def f():
+    try:
+        pass
+    except ValueError:
+        try:
+            pass
+        except OSError:
+            pass
+        else:
+            raise RuntimeError("lost")
+"""
+        self.assertEqual(len(self._codes(code, 'EXC005')), 1)
+
+    def test_lossy_raise_in_nested_handler_reported_once(self):
+        """The inner handler is checked when visit_Try reaches it, not twice."""
+        code = """
+def f():
+    try:
+        pass
+    except ValueError:
+        try:
+            pass
+        except OSError:
+            raise RuntimeError("lost")
+"""
+        self.assertEqual(len(self._codes(code, 'EXC005')), 1)
+
+    def test_broad_except_matches_tuple_and_dotted(self):
+        for clause in ('Exception', '(ValueError, Exception)', 'builtins.Exception'):
+            code = f"import builtins\ntry:\n    f()\nexcept {clause}:\n    g()\n"
+            self.assertEqual(len(self._codes(code, 'EXC002')), 1, clause)
+
+    def test_narrow_except_still_quiet(self):
+        for clause in ('ValueError', '(ValueError, OSError)'):
+            code = f"try:\n    f()\nexcept {clause}:\n    g()\n"
+            self.assertEqual(self._codes(code, 'EXC002'), [], clause)
+
+    def test_duplicate_tuple_dict_key(self):
+        issues = self._codes("D = {(1, 2): 'a', (1, 2): 'b'}\n", 'BUG002')
+        self.assertEqual(len(issues), 1)
+        self.assertIn('(1, 2)', issues[0].message)
+
+    def test_distinct_tuple_keys_are_not_duplicates(self):
+        self.assertEqual(self._codes("D = {(1, 2): 'a', (2, 1): 'b'}\n", 'BUG002'), [])
+
+    def test_non_literal_tuple_key_ignored(self):
+        self.assertEqual(self._codes("D = {(1, x): 'a', (1, x): 'b'}\n", 'BUG002'), [])
+
+    def test_dunder_all_augmented_and_method_forms_count_as_use(self):
+        for line in ("__all__ += ['helper']",
+                     "__all__.extend(['helper'])",
+                     "__all__.append('helper')"):
+            code = f"from .util import helper\n__all__ = []\n{line}\n"
+            self.assertEqual(self._codes(code, 'IMP002'), [], line)
+
+    def test_dunder_all_outside_module_scope_is_not_a_use(self):
+        code = "from .util import helper\ndef f():\n    __all__ = ['helper']\n    return __all__\n"
+        self.assertEqual(len(self._codes(code, 'IMP002')), 1)
+
+
 class TestResourceOwnership(unittest.TestCase):
 
     def _res(self, code):
