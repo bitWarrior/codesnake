@@ -1,8 +1,20 @@
 # CodeSnake
 
+[![CI](https://github.com/bitWarrior/codesnake/actions/workflows/ci.yml/badge.svg)](https://github.com/bitWarrior/codesnake/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/codesnake.svg)](https://pypi.org/project/codesnake/)
+[![Python](https://img.shields.io/pypi/pyversions/codesnake.svg)](https://pypi.org/project/codesnake/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Semantic code checker for Python 3. It parses files into an AST, walks them, and reports security problems, common bugs, unused names, and complexity smells.
 
-Requires **Python 3.10+**. The checker itself has **no runtime dependencies** beyond the standard library.
+Two properties set it apart from the fast general-purpose linters:
+
+- **It never imports or executes the code it analyzes.** Everything runs on the AST from `ast.parse`, so pointing it at untrusted Python — a fork's pull request, a submitted plugin — does not run that Python.
+- **It has no runtime dependencies.** Standard library only, so it vendors cleanly, works air-gapped, and adds nothing to your supply chain.
+
+It also does light **taint tracking**: `eval()` on a literal is `info`, `eval()` on something derived from `input()` or `request.args` is an `error`. See [how it compares](#how-it-compares) to Ruff, Bandit, and pylint.
+
+Requires **Python 3.10+**.
 
 ## Install
 
@@ -27,6 +39,28 @@ python -m codesnake check file.py            # after install
 PYTHONPATH=src python -m codesnake file.py   # straight from a checkout
 ./codesnake.sh file.py                        # creates/activates codesnake-venv/
 ```
+
+## First run on an existing codebase
+
+CodeSnake reports complexity, length, and unused-name findings by default, so the
+first run on a mature codebase is loud — expect roughly ten warnings per file. That
+is a backlog, not an emergency: only `error` severity fails the run. Start narrow and
+widen when you are ready.
+
+```bash
+# 1. What would actually fail CI. Start here.
+codesnake check --severity error src/
+
+# 2. Snapshot everything else, so CI only fails on NEW findings.
+codesnake check --update-baseline .codesnake-baseline.json src/
+git add .codesnake-baseline.json
+
+# 3. From now on, this is your CI command.
+codesnake check --baseline .codesnake-baseline.json src/
+```
+
+Then tune thresholds in `.codesnake.json` and shrink the baseline as you go. The full
+adoption path is in [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md#adopting-codesnake-on-an-existing-codebase).
 
 ## Usage
 
@@ -212,9 +246,52 @@ rc = run_check(
 
 Each `Issue` includes `line`, `col`, `end_line`, `end_col`, `suggestion`, and `source` (`codesnake` or `bandit`). `col` / `end_col` are **0-based character offsets** (AST byte offsets are converted), and JSON output reports them as-is. The `text`, `github`, and `sarif` formats print **1-based** columns.
 
+## How it compares
+
+CodeSnake is not trying to replace Ruff. Use both.
+
+| | CodeSnake | Ruff | Bandit | pylint |
+|---|---|---|---|---|
+| Speed, 167 stdlib files | 1.7s | **0.14s** | 9.1s | 17.4s |
+| Rules | ~25 | 800+ | ~70 security | 400+ |
+| Runtime dependencies | **none** | none (Rust binary) | several | several |
+| Imports the analyzed code | **never** | never | never | in some modes |
+| Taint tracking | **yes** | no | limited | no |
+| Autofix | no | **yes** | no | no |
+| SARIF output | **yes** | no | **yes** | no |
+| Baselines | **yes** | no | via `--baseline` | no |
+
+**Ruff is roughly 13x faster and has 30x the rules.** If you want one fast
+general-purpose linter with autofix, use Ruff — CodeSnake is not competing for that job.
+Among the Python-implemented checkers, though, CodeSnake is the quick one: about 5x
+faster than Bandit and 10x faster than pylint on the same files.
+
+<sub>Measured on Python 3.12, best of 2–3 runs over the same 167 files from the standard
+library, each tool using its own parallelism where it has any (`codesnake` auto,
+`pylint -j 0`). pylint ran with `--disable=all --enable=W,E`, a reduced rule set in its
+favor. Your numbers will differ; the ranking is the point, not the digits.</sub>
+
+CodeSnake is worth adding when you want one of these:
+
+- **Taint tracking.** `eval(x)` where `x` came from `input()` or `request.args` is an
+  `error`; `eval("1+1")` is `info`. The fast linters flag the call site without asking
+  where the data came from.
+- **Analysis of untrusted code.** No import, no execution, no dependencies — safe to
+  run over a fork's PR or a user-submitted plugin.
+- **A vendorable checker.** One pure-Python package with an empty dependency list,
+  auditable in an afternoon, no toolchain.
+- **SARIF plus stable baselines**, for GitHub code scanning on a codebase with an
+  existing backlog.
+
+Bandit has far broader security coverage; `--bandit` merges its findings into the same
+report if you want both.
+
 ## Performance
 
 Files are analyzed in a process pool once there are 8 or more of them (one worker per CPU); pass `--jobs 1` for a strictly sequential run or `--jobs N` to pin the count. Output order is always the input order.
+
+Roughly 100 files/second single-process on a modern laptop. CodeSnake is pure Python
+doing a full AST walk per file; if analysis time dominates your CI, reach for Ruff.
 
 ## Tests
 
