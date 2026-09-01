@@ -6,6 +6,20 @@ All notable changes to CodeSnake are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-01
+
+First release published to PyPI. The package itself is byte-identical to 1.2.0 —
+`src/` and `pyproject.toml` are unchanged — so there is nothing to upgrade for if you
+are already running 1.2.0 from source.
+
+### Changed
+
+- The release workflow gained a `workflow_dispatch` trigger, so a publish can be
+  retried without recreating the GitHub Release. Both entry points share the same
+  tag/version guard.
+- Checkout in the release build is pinned to the tag being released rather than
+  defaulting to the branch.
+
 ## [1.2.0] - 2026-09-01
 
 A correctness release. Three defects made the tool quietly under-deliver, and six rules
@@ -96,6 +110,7 @@ A correctness, precision, and packaging release. 189 tests, up from 91.
 - Version single-sourced from `codesnake/_version.py`.
 - MIT `LICENSE` added, with PEP 639 metadata; CI on Python 3.10 through 3.13.
 
-[Unreleased]: https://github.com/bitWarrior/codesnake/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/bitWarrior/codesnake/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/bitWarrior/codesnake/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/bitWarrior/codesnake/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bitWarrior/codesnake/releases/tag/v1.1.0
