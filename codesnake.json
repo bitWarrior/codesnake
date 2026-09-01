@@ -11,6 +11,8 @@
   "check_performance": true,
   "check_imports": true,
   "check_style": true,
+  "check_unused": true,
+  "use_bandit": false,
   "report_errors": true,
   "report_warnings": true,
   "report_info": false

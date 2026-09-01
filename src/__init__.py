@@ -18,8 +18,15 @@ from .codesnake import (
     Issue,
     SemanticChecker,
     check_file,
+    collect_module_exports,
+    expand_python_targets,
+    git_staged_python_files,
+    issue_fingerprint,
+    load_baseline,
     load_config,
+    read_python_source,
     run_check,
+    write_baseline,
 )
 
 __all__ = [
@@ -29,6 +36,13 @@ __all__ = [
     'Issue',
     'SemanticChecker',
     'check_file',
+    'collect_module_exports',
+    'expand_python_targets',
+    'git_staged_python_files',
+    'issue_fingerprint',
+    'load_baseline',
     'load_config',
+    'read_python_source',
     'run_check',
+    'write_baseline',
 ]

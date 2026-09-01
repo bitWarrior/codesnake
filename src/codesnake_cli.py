@@ -33,7 +33,7 @@ def main():
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     check_parser = subparsers.add_parser('check', help='Check Python files')
-    check_parser.add_argument('files', nargs='+', help='Files to check')
+    check_parser.add_argument('files', nargs='*', help='Files or directories to check')
     check_parser.add_argument('--config', help='Config file path')
     check_parser.add_argument(
         '--format',
@@ -47,6 +47,22 @@ def main():
         help='Minimum severity',
     )
     check_parser.add_argument('--no-color', action='store_true', help='Disable ANSI colors')
+    check_parser.add_argument(
+        '--bandit',
+        action='store_true',
+        help='Merge findings from the bandit security scanner if it is installed',
+    )
+    check_parser.add_argument(
+        '--staged',
+        action='store_true',
+        help='Check only Python files staged in git',
+    )
+    check_parser.add_argument('--baseline', help='Ignore issues listed in this baseline JSON file')
+    check_parser.add_argument(
+        '--update-baseline',
+        metavar='FILE',
+        help='Write current findings to a baseline JSON file',
+    )
 
     test_parser = subparsers.add_parser('test', help='Run test suite')
     test_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
@@ -72,6 +88,9 @@ def main():
         return 0
 
     if args.command == 'check':
+        if not args.files and not args.staged:
+            print("Error: provide files to check, or pass --staged", file=sys.stderr)
+            return 1
         return run_check(
             args.files,
             config_path=args.config,
@@ -79,6 +98,10 @@ def main():
             min_severity=args.severity,
             show_banner=(args.format == 'text'),
             color=False if args.no_color else None,
+            use_bandit=True if args.bandit else None,
+            staged=args.staged,
+            baseline_path=args.baseline,
+            update_baseline=getattr(args, 'update_baseline', None),
         )
 
     if args.command == 'test':

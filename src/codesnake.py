@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import json
 import os
+import re
+import shutil
+import subprocess as _subprocess
 import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, TextIO, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Pattern, Sequence, Set, TextIO, Tuple
 
 
 SEVERITY_RANK = {'error': 3, 'warning': 2, 'info': 1}
@@ -28,6 +32,7 @@ CATEGORY_FLAGS = {
     'performance': 'check_performance',
     'imports': 'check_imports',
     'style': 'check_style',
+    'unused': 'check_unused',
 }
 
 # Always surface these even when report_errors is false (fail closed).
@@ -64,11 +69,262 @@ MUTABLE_CTOR_NAMES = frozenset({
     'builtins.set',
 })
 
+OPEN_NAMES = frozenset({'open', 'builtins.open', 'io.open'})
+
+TAINT_CALL_NAMES = frozenset({
+    'input',
+    'builtins.input',
+    'os.getenv',
+    'os.environ.get',
+})
+
+TAINT_ATTR_NAMES = frozenset({
+    'sys.argv',
+    'os.environ',
+    'sys.stdin',
+})
+
+REQUEST_TAINT_ATTRS = frozenset({
+    'args', 'GET', 'POST', 'json', 'data', 'form', 'cookies', 'headers',
+    'values', 'query_params', 'query', 'params', 'body', 'files',
+})
+
+ABSTRACT_DECORATORS = frozenset({
+    'abstractmethod',
+    'abc.abstractmethod',
+    'overload',
+    'typing.overload',
+})
+
+ISSUE_SUGGESTIONS = {
+    'SEC001': 'Do not evaluate untrusted strings; use ast.literal_eval or a real parser.',
+    'SEC002': 'Avoid pickle for untrusted data; use json or a dedicated serializer.',
+    'SEC003': 'Pass a sequence of arguments with shell=False.',
+    'SEC004': 'Pass a fixed executable and argument list, not a user-built command string.',
+    'BUG001': 'Use None as the default and create the mutable object inside the function.',
+    'BUG002': 'Remove or rename the duplicate key.',
+    'EXC001': "Catch specific exceptions, or use 'except Exception:' if you must.",
+    'EXC003': 'Log, re-raise, or handle the error; do not use a bare pass.',
+    'EXC005': "Use 'raise NewError(...) from exc' to chain the original exception.",
+    'IMP001': 'Import only the names you need.',
+    'IMP002': 'Remove the unused import.',
+    'IMP003': 'Import a name that the sibling module actually defines, or add that name.',
+    'RES001': "Use 'with open(...) as handle:'.",
+    'ASY001': 'Await a coroutine, or make the function synchronous.',
+    'VAR001': 'Remove the unused name, or prefix it with _ if it is intentional.',
+    'VAR002': 'Remove the unused argument, or prefix it with _ if it is required by an API.',
+    'PERF001': 'Use enumerate() to get both index and value.',
+    'STYLE001': "Write 'if flag:' or 'if not flag:'.",
+}
+
 NESTED_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+SKIP_UNUSED_NAMES = frozenset({'self', 'cls', 'mcs', 'mcls'})
+_BUILTIN_NAMES = frozenset(name for name in dir(builtins) if not name.startswith('_'))
+
+SKIP_DIR_NAMES = frozenset({
+    '.git', '.hg', '.svn', '.tox', '.nox',
+    '.mypy_cache', '.pytest_cache', '.ruff_cache', '.coverage',
+    '__pycache__', 'site-packages', 'dist', 'build', 'htmlcov',
+    'node_modules', '.venv', 'venv', 'codesnake-venv', 'env', '.env',
+})
+
+_NOQA_RE = re.compile(
+    r'#\s*(?:noqa|codesnake:\s*ignore)\b(?:\s*[:=]\s*([^\n#]+))?',
+    re.IGNORECASE,
+)
+_CODING_COOKIE_RE = re.compile(
+    br'^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)',
+    re.IGNORECASE,
+)
+_TYPE_CHECKING_NAMES = frozenset({'TYPE_CHECKING', 'typing.TYPE_CHECKING'})
 
 
 class ConfigError(Exception):
     """Raised when a configuration file cannot be loaded."""
+
+
+@dataclass
+class _Binding:
+    name: str
+    line: int
+    col: int
+    kind: str  # import, arg, assign, function, class
+
+
+class _Scope:
+    __slots__ = ('kind', 'name', 'bindings', 'used', 'global_names',
+                 'nonlocal_names', 'constants', 'tainted')
+
+    def __init__(self, kind: str, name: str = ''):
+        self.kind = kind
+        self.name = name
+        self.bindings: Dict[str, _Binding] = {}
+        self.used: Set[str] = set()
+        self.global_names: Set[str] = set()
+        self.nonlocal_names: Set[str] = set()
+        self.constants: Dict[str, Any] = {}
+        self.tainted: Set[str] = set()
+
+
+@dataclass
+class _GitIgnorePattern:
+    negated: bool
+    dir_only: bool
+    regex: Pattern[str]
+
+    def matches(self, rel: str, is_dir: bool) -> bool:
+        if self.dir_only and not is_dir:
+            return False
+        return self.regex.search(rel) is not None
+
+
+def _gitignore_glob_to_regex(pattern: str, anchored: bool) -> Pattern[str]:
+    parts: List[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith('**/', i):
+            parts.append('(?:.*/)?')
+            i += 3
+        elif pattern.startswith('**', i):
+            parts.append('.*')
+            i += 2
+        elif pattern[i] == '*':
+            parts.append('[^/]*')
+            i += 1
+        elif pattern[i] == '?':
+            parts.append('[^/]')
+            i += 1
+        else:
+            parts.append(re.escape(pattern[i]))
+            i += 1
+    body = ''.join(parts)
+    if anchored:
+        regex = '^' + body + '(?:/.*)?$'
+    else:
+        regex = r'(?:^|/)' + body + r'(?:/.*)?$'
+    return re.compile(regex)
+
+
+def _parse_gitignore_text(text: str) -> List[_GitIgnorePattern]:
+    parsed: List[_GitIgnorePattern] = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.startswith('#'):
+            continue
+        negated = line.startswith('!')
+        if negated:
+            line = line[1:]
+        dir_only = line.endswith('/')
+        if dir_only:
+            line = line[:-1]
+        anchored = line.startswith('/')
+        if anchored:
+            line = line[1:]
+        if not line:
+            continue
+        parsed.append(_GitIgnorePattern(
+            negated=negated,
+            dir_only=dir_only,
+            regex=_gitignore_glob_to_regex(line, anchored),
+        ))
+    return parsed
+
+
+class _IgnoreStack:
+    def __init__(self) -> None:
+        self._entries: List[Tuple[Path, List[_GitIgnorePattern]]] = []
+
+    def add_gitignore(self, gi_path: Path) -> None:
+        try:
+            text = gi_path.read_text(encoding='utf-8')
+        except OSError:
+            return
+        self._entries.append((gi_path.parent.resolve(), _parse_gitignore_text(text)))
+
+    def ignored(self, path: Path, is_dir: bool) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        ignored = False
+        for base, patterns in self._entries:
+            try:
+                rel = resolved.relative_to(base).as_posix()
+            except ValueError:
+                continue
+            for pattern in patterns:
+                if pattern.matches(rel, is_dir):
+                    ignored = not pattern.negated
+        return ignored
+
+
+def detect_source_encoding(data: bytes) -> str:
+    """PEP 263 encoding cookie, else UTF-8 (with BOM)."""
+    if data.startswith(b'\xef\xbb\xbf'):
+        return 'utf-8-sig'
+    chunks = data.split(b'\n', 2)[:2]
+    for raw_line in chunks:
+        match = _CODING_COOKIE_RE.match(raw_line.replace(b'\r', b''))
+        if match:
+            encoding = match.group(1).decode('ascii', errors='replace')
+            if encoding.lower() in ('utf-8', 'utf8'):
+                return 'utf-8'
+            return encoding
+    return 'utf-8'
+
+
+def read_python_source(path: Path) -> str:
+    data = path.read_bytes()
+    encoding = detect_source_encoding(data)
+    return data.decode(encoding)
+
+
+def ignored_codes_on_line(line: str) -> Optional[Set[str]]:
+    """None = no pragma; empty set = ignore all codes; otherwise specific codes."""
+    match = _NOQA_RE.search(line)
+    if not match:
+        return None
+    spec = match.group(1)
+    if not spec:
+        return set()
+    return {part.strip().upper() for part in spec.replace(',', ' ').split() if part.strip()}
+
+
+def iter_python_files(root: Path) -> Iterable[Path]:
+    """Yield .py files under root, skipping venvs, caches, and .gitignore matches."""
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        root_resolved = root
+    ignore = _IgnoreStack()
+    root_gi = root_resolved / '.gitignore'
+    if root_gi.is_file():
+        ignore.add_gitignore(root_gi)
+
+    for dirpath, dirnames, filenames in os.walk(root_resolved):
+        current = Path(dirpath)
+        nested_gi = current / '.gitignore'
+        if nested_gi.is_file() and nested_gi != root_gi:
+            ignore.add_gitignore(nested_gi)
+
+        kept: List[str] = []
+        for name in dirnames:
+            if name in SKIP_DIR_NAMES or name.endswith('.egg-info'):
+                continue
+            sub = current / name
+            if ignore.ignored(sub, is_dir=True):
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+
+        for name in filenames:
+            if not name.endswith('.py'):
+                continue
+            filepath = current / name
+            if ignore.ignored(filepath, is_dir=False):
+                continue
+            yield filepath
 
 
 @dataclass
@@ -81,6 +337,10 @@ class Issue:
     col: int
     code: str  # Issue code like 'SEC001', 'PERF001', etc.
     filename: str = ''
+    source: str = 'codesnake'
+    end_line: int = 0
+    end_col: int = 0
+    suggestion: str = ''
 
 
 @dataclass
@@ -98,6 +358,8 @@ class CheckerConfig:
     check_performance: bool = True
     check_imports: bool = True
     check_style: bool = True
+    check_unused: bool = True
+    use_bandit: bool = False
     report_errors: bool = True
     report_warnings: bool = True
     report_info: bool = True
@@ -165,6 +427,7 @@ class SemanticChecker(ast.NodeVisitor):
         source_code: str,
         filename: str = '<string>',
         config: Optional[CheckerConfig] = None,
+        known_exports: Optional[Dict[str, Set[str]]] = None,
     ):
         self.source_code = source_code
         self.filename = filename
@@ -179,6 +442,10 @@ class SemanticChecker(ast.NodeVisitor):
         self.used_names: Set[str] = set()
         self.function_complexity: Dict[str, int] = {}
         self.aliases: Dict[str, str] = {}
+        self.scopes: List[_Scope] = []
+        self._in_type_checking = False
+        self._with_expr_ids: Set[int] = set()
+        self.known_exports = known_exports or {}
 
     def add_issue(
         self,
@@ -191,15 +458,297 @@ class SemanticChecker(ast.NodeVisitor):
         """Add an issue to the issues list if the category is enabled."""
         if not self.config.allows_category(category):
             return
+        self._record_issue(
+            severity,
+            category,
+            message,
+            getattr(node, 'lineno', 0) or 0,
+            getattr(node, 'col_offset', 0) or 0,
+            code,
+            end_line=getattr(node, 'end_lineno', None) or getattr(node, 'lineno', 0) or 0,
+            end_col=getattr(node, 'end_col_offset', None) or getattr(node, 'col_offset', 0) or 0,
+        )
+
+    def _record_issue(
+        self,
+        severity: str,
+        category: str,
+        message: str,
+        line: int,
+        col: int,
+        code: str,
+        source: str = 'codesnake',
+        end_line: int = 0,
+        end_col: int = 0,
+        suggestion: str = '',
+    ) -> None:
+        if not self.config.allows_category(category):
+            return
         self.issues.append(Issue(
             severity=severity,
             category=category,
             message=message,
-            line=getattr(node, 'lineno', 0) or 0,
-            col=getattr(node, 'col_offset', 0) or 0,
+            line=line,
+            col=col,
             code=code,
             filename=self.filename,
+            source=source,
+            end_line=end_line or line,
+            end_col=end_col or col,
+            suggestion=suggestion or ISSUE_SUGGESTIONS.get(code, ''),
         ))
+
+    def _current_scope(self) -> Optional[_Scope]:
+        return self.scopes[-1] if self.scopes else None
+
+    def _push_scope(self, kind: str, name: str = '') -> _Scope:
+        scope = _Scope(kind, name)
+        self.scopes.append(scope)
+        return scope
+
+    def _pop_scope(self) -> Optional[_Scope]:
+        if not self.scopes:
+            return None
+        scope = self.scopes.pop()
+        if scope.kind == 'function':
+            self._report_unused_locals(scope)
+        elif scope.kind == 'module':
+            self._report_unused_imports(scope)
+        return scope
+
+    def _bind(self, name: str, node: ast.AST, kind: str) -> None:
+        scope = self._current_scope()
+        if scope is None:
+            return
+        if name in scope.global_names:
+            if len(self.scopes) > 1:
+                self.scopes[0].bindings.setdefault(name, _Binding(
+                    name,
+                    getattr(node, 'lineno', 0) or 0,
+                    getattr(node, 'col_offset', 0) or 0,
+                    kind,
+                ))
+            return
+        if name in scope.nonlocal_names:
+            return
+        if name not in scope.bindings:
+            if kind in ('assign', 'arg', 'function') and scope.kind == 'function':
+                self._maybe_shadow(name, node)
+            scope.bindings[name] = _Binding(
+                name,
+                getattr(node, 'lineno', 0) or 0,
+                getattr(node, 'col_offset', 0) or 0,
+                kind,
+            )
+
+    def _maybe_shadow(self, name: str, node: ast.AST) -> None:
+        if name.startswith('_') or name in SKIP_UNUSED_NAMES or name in _BUILTIN_NAMES:
+            return
+        for scope in reversed(self.scopes[:-1]):
+            if scope.kind == 'class' or scope.kind == 'comprehension':
+                continue
+            if scope.kind == 'module':
+                return
+            if name in scope.bindings:
+                self.add_issue(
+                    'info',
+                    'unused',
+                    f"Name '{name}' shadows a name from an enclosing function",
+                    node,
+                    'VAR003',
+                )
+                return
+
+    def _mark_used(self, name: str) -> None:
+        for scope in reversed(self.scopes):
+            if name in scope.nonlocal_names:
+                continue
+            if name in scope.bindings or name in scope.global_names:
+                scope.used.add(name)
+                if name in scope.global_names and self.scopes:
+                    self.scopes[0].used.add(name)
+                return
+        if self.scopes and name in self.scopes[0].bindings:
+            self.scopes[0].used.add(name)
+
+    def _lookup_const(self, name: str) -> Any:
+        for scope in reversed(self.scopes):
+            if name in scope.constants:
+                return scope.constants[name]
+        return None
+
+    def _set_const(self, name: str, value: Any) -> None:
+        scope = self._current_scope()
+        if scope is not None:
+            scope.constants[name] = value
+
+    def _mark_name_tainted(self, name: str) -> None:
+        for scope in reversed(self.scopes):
+            if name in scope.global_names:
+                self.scopes[0].tainted.add(name)
+                return
+            if name in scope.bindings:
+                scope.tainted.add(name)
+                return
+        if self.scopes:
+            self.scopes[-1].tainted.add(name)
+
+    def _name_is_tainted(self, name: str) -> bool:
+        for scope in reversed(self.scopes):
+            if name in scope.tainted:
+                return True
+            if name in scope.bindings:
+                return False
+        return False
+
+    def _mark_tainted_target(self, target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            self._mark_name_tainted(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._mark_tainted_target(elt)
+        elif isinstance(target, ast.Starred):
+            self._mark_tainted_target(target.value)
+
+    def _is_tainted_expr(self, node: Optional[ast.AST]) -> bool:
+        if node is None:
+            return False
+        if isinstance(node, ast.Constant):
+            return False
+        if isinstance(node, ast.Name):
+            return self._name_is_tainted(node.id)
+        if isinstance(node, ast.JoinedStr):
+            return any(self._is_tainted_expr(value) for value in node.values)
+        if isinstance(node, ast.FormattedValue):
+            return self._is_tainted_expr(node.value)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            return self._is_tainted_expr(node.left) or self._is_tainted_expr(node.right)
+        if isinstance(node, ast.Call):
+            resolved = self._resolve_name(node.func)
+            if resolved in TAINT_CALL_NAMES:
+                return True
+            if isinstance(node.func, ast.Attribute) and node.func.attr in ('get', 'format'):
+                if self._is_tainted_expr(node.func.value):
+                    return True
+                if any(self._is_tainted_expr(arg) for arg in node.args):
+                    return True
+            return any(self._is_tainted_expr(arg) for arg in node.args)
+        if isinstance(node, ast.Attribute):
+            resolved = self._resolve_name(node)
+            if resolved in TAINT_ATTR_NAMES:
+                return True
+            if node.attr in REQUEST_TAINT_ATTRS:
+                return True
+            return self._is_tainted_expr(node.value)
+        if isinstance(node, ast.Subscript):
+            return self._is_tainted_expr(node.value)
+        if isinstance(node, ast.Starred):
+            return self._is_tainted_expr(node.value)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return any(self._is_tainted_expr(elt) for elt in node.elts)
+        return False
+
+    def _is_literal_expr(self, node: Optional[ast.AST]) -> bool:
+        if node is None:
+            return False
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            if self._name_is_tainted(node.id):
+                return False
+            for scope in reversed(self.scopes):
+                if node.id in scope.constants:
+                    return True
+            return False
+        if isinstance(node, ast.JoinedStr):
+            return all(
+                isinstance(value, ast.Constant) or (
+                    isinstance(value, ast.FormattedValue)
+                    and self._is_literal_expr(value.value)
+                )
+                for value in node.values
+            )
+        return False
+
+    def _report_unused_imports(self, scope: _Scope) -> None:
+        for name, binding in scope.bindings.items():
+            if binding.kind != 'import':
+                continue
+            if name in scope.used:
+                continue
+            self._record_issue(
+                'warning',
+                'imports',
+                f"Imported name '{name}' is unused",
+                binding.line,
+                binding.col,
+                'IMP002',
+            )
+
+    def _report_unused_locals(self, scope: _Scope) -> None:
+        for name, binding in scope.bindings.items():
+            if name in scope.used:
+                continue
+            if name in SKIP_UNUSED_NAMES or name.startswith('_'):
+                continue
+            if binding.kind == 'arg':
+                self._record_issue(
+                    'warning',
+                    'unused',
+                    f"Unused argument '{name}'",
+                    binding.line,
+                    binding.col,
+                    'VAR002',
+                )
+            elif binding.kind in ('assign', 'function', 'class'):
+                label = 'nested function' if binding.kind == 'function' else (
+                    'nested class' if binding.kind == 'class' else 'local variable'
+                )
+                self._record_issue(
+                    'warning',
+                    'unused',
+                    f"Unused {label} '{name}'",
+                    binding.line,
+                    binding.col,
+                    'VAR001',
+                )
+
+    def _is_ignored(self, issue: Issue) -> bool:
+        if issue.line <= 0 or issue.line > len(self.source_lines):
+            return False
+        codes = ignored_codes_on_line(self.source_lines[issue.line - 1])
+        if codes is None:
+            return False
+        if not codes:
+            return True
+        return issue.code.upper() in codes
+
+    def _is_type_checking_test(self, test: ast.AST) -> bool:
+        resolved = self._resolve_name(test)
+        return resolved in _TYPE_CHECKING_NAMES
+
+    def _record_dunder_all(self, node: ast.Assign) -> None:
+        if not self.scopes or self.scopes[-1].kind != 'module':
+            return
+        names: List[str] = []
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == '__all__':
+                value = node.value
+                elts: Sequence[ast.AST] = []
+                if isinstance(value, (ast.List, ast.Tuple)):
+                    elts = value.elts
+                for elt in elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        names.append(elt.value)
+        for name in names:
+            self.scopes[0].used.add(name)
+
+    def _record_constant_assign(self, targets: Sequence[ast.AST], value: ast.AST) -> None:
+        if not isinstance(value, ast.Constant):
+            return
+        for target in targets:
+            if isinstance(target, ast.Name):
+                self._set_const(target.id, value.value)
 
     def _collect_imports(self, tree: ast.AST) -> None:
         """Build a name -> qualified-name map from import statements."""
@@ -235,10 +784,95 @@ class SemanticChecker(ast.NodeVisitor):
             return node.attr
         return None
 
+    def _is_abstract(self, node: ast.AST) -> bool:
+        for decorator in getattr(node, 'decorator_list', []):
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            resolved = self._resolve_name(target) or ''
+            if resolved.rsplit('.', 1)[-1] in {'abstractmethod', 'overload'}:
+                return True
+            if resolved in ABSTRACT_DECORATORS:
+                return True
+        return False
+
+    def _is_stub_body(self, node: ast.AST) -> bool:
+        body = list(getattr(node, 'body', []))
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]
+        if not body:
+            return True
+        if len(body) == 1 and isinstance(body[0], ast.Pass):
+            return True
+        if (
+            len(body) == 1
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and body[0].value.value is ...
+        ):
+            return True
+        return False
+
+    def _async_body_has_await(self, node: ast.AST) -> bool:
+        for child in ast.iter_child_nodes(node):
+            if self._subtree_has_await(child):
+                return True
+        return False
+
+    def _subtree_has_await(self, node: ast.AST) -> bool:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return False
+        if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            return True
+        return any(self._subtree_has_await(child) for child in ast.iter_child_nodes(node))
+
+    def _iter_raises(self, stmts: Sequence[ast.AST]) -> Iterable[ast.Raise]:
+        for stmt in stmts:
+            if isinstance(stmt, ast.Raise):
+                yield stmt
+            elif isinstance(stmt, ast.If):
+                yield from self._iter_raises(stmt.body)
+                yield from self._iter_raises(stmt.orelse)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                yield from self._iter_raises(stmt.body)
+                yield from self._iter_raises(getattr(stmt, 'orelse', []))
+            elif isinstance(stmt, ast.Try):
+                yield from self._iter_raises(stmt.body)
+                yield from self._iter_raises(stmt.finalbody)
+
+    def _check_lossy_raises(self, handler: ast.ExceptHandler) -> None:
+        for raise_node in self._iter_raises(handler.body):
+            if raise_node.exc is None:
+                continue
+            if raise_node.cause is not None:
+                continue
+            if (
+                isinstance(raise_node.exc, ast.Name)
+                and handler.name
+                and raise_node.exc.id == handler.name
+            ):
+                continue
+            if isinstance(raise_node.exc, (ast.Call, ast.Name)):
+                self.add_issue(
+                    'warning',
+                    'exceptions',
+                    "Raising a new exception in 'except' hides the original - use 'raise ... from'",
+                    raise_node,
+                    'EXC005',
+                )
+
     def _keyword_true(self, node: ast.Call, name: str) -> bool:
         for keyword in node.keywords:
-            if keyword.arg == name and isinstance(keyword.value, ast.Constant):
-                return keyword.value.value is True
+            if keyword.arg != name:
+                continue
+            value = keyword.value
+            if isinstance(value, ast.Constant) and value.value is True:
+                return True
+            if isinstance(value, ast.Name) and self._lookup_const(value.id) is True:
+                return True
         return False
 
     # Security Checks
@@ -249,13 +883,31 @@ class SemanticChecker(ast.NodeVisitor):
 
         if resolved in EVAL_EXEC_NAMES:
             called = resolved.rsplit('.', 1)[-1]
-            self.add_issue(
-                'error',
-                'security',
-                f"Dangerous use of '{called}()' - can execute arbitrary code",
-                node,
-                'SEC001',
-            )
+            arg0 = node.args[0] if node.args else None
+            if arg0 is not None and self._is_tainted_expr(arg0):
+                self.add_issue(
+                    'error',
+                    'security',
+                    f"Dangerous use of '{called}()' on untrusted input",
+                    node,
+                    'SEC001',
+                )
+            elif arg0 is not None and self._is_literal_expr(arg0):
+                self.add_issue(
+                    'info',
+                    'security',
+                    f"Use of '{called}()' on a constant - avoid eval/exec",
+                    node,
+                    'SEC001',
+                )
+            else:
+                self.add_issue(
+                    'error',
+                    'security',
+                    f"Dangerous use of '{called}()' - can execute arbitrary code",
+                    node,
+                    'SEC001',
+                )
 
         if resolved in PICKLE_LOAD_NAMES:
             self.add_issue(
@@ -266,15 +918,75 @@ class SemanticChecker(ast.NodeVisitor):
                 'SEC002',
             )
 
-        if resolved in SUBPROCESS_SHELL_NAMES and self._keyword_true(node, 'shell'):
+        if resolved in SUBPROCESS_SHELL_NAMES:
+            cmd = node.args[0] if node.args else None
+            tainted_cmd = cmd is not None and self._is_tainted_expr(cmd)
+            if self._keyword_true(node, 'shell'):
+                if tainted_cmd:
+                    self.add_issue(
+                        'error',
+                        'security',
+                        "subprocess with shell=True and untrusted input is command injection",
+                        node,
+                        'SEC003',
+                    )
+                else:
+                    self.add_issue(
+                        'warning',
+                        'security',
+                        "subprocess with shell=True is a security risk - use shell=False",
+                        node,
+                        'SEC003',
+                    )
+            elif tainted_cmd:
+                self.add_issue(
+                    'warning',
+                    'security',
+                    "subprocess command built from untrusted input",
+                    node,
+                    'SEC004',
+                )
+
+        if resolved in OPEN_NAMES and id(node) not in self._with_expr_ids:
             self.add_issue(
                 'warning',
-                'security',
-                "subprocess with shell=True is a security risk - use shell=False",
+                'bugs',
+                "open() should be used as a context manager (with open(...) as ...)",
                 node,
-                'SEC003',
+                'RES001',
             )
 
+        self.generic_visit(node)
+
+    def visit_With(self, node: ast.With):
+        for item in node.items:
+            self._with_expr_ids.add(id(item.context_expr))
+        self.generic_visit(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith):
+        for item in node.items:
+            self._with_expr_ids.add(id(item.context_expr))
+        self.generic_visit(node)
+
+    def visit_Dict(self, node: ast.Dict):
+        seen: Dict[Any, ast.AST] = {}
+        for key in node.keys:
+            if key is None or not isinstance(key, ast.Constant):
+                continue
+            value = key.value
+            if isinstance(value, float) and value != value:
+                continue
+            if isinstance(value, (str, int, float, bool, bytes, type(None))):
+                if value in seen:
+                    self.add_issue(
+                        'warning',
+                        'bugs',
+                        f"Duplicate dictionary key {value!r}",
+                        key,
+                        'BUG002',
+                    )
+                else:
+                    seen[value] = key
         self.generic_visit(node)
 
     def visit_Assert(self, node: ast.Assert):
@@ -291,9 +1003,20 @@ class SemanticChecker(ast.NodeVisitor):
     # Function / lambda analysis (shared)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._bind(node.name, node, 'function')
         self._check_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self._bind(node.name, node, 'function')
+        if not self._is_abstract(node) and not self._is_stub_body(node):
+            if not self._async_body_has_await(node):
+                self.add_issue(
+                    'warning',
+                    'reliability',
+                    f"Async function '{node.name}' never awaits - it will not yield to the event loop",
+                    node,
+                    'ASY001',
+                )
         self._check_function(node)
 
     def visit_Lambda(self, node: ast.Lambda):
@@ -385,14 +1108,25 @@ class SemanticChecker(ast.NodeVisitor):
                         'COMP003',
                     )
 
+        self._push_scope('function', name)
+        for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+            self._bind(arg.arg, arg, 'arg')
+        if args.vararg is not None:
+            self._bind(args.vararg.arg, args.vararg, 'arg')
+        if args.kwarg is not None:
+            self._bind(args.kwarg.arg, args.kwarg, 'arg')
+
         self.generic_visit(node)
+        self._pop_scope()
         self.current_function = old_function
 
     def visit_ClassDef(self, node: ast.ClassDef):
         """Check class definitions."""
+        self._bind(node.name, node, 'class')
         old_class = self.current_class
         self.current_class = node.name
         self.defined_names.add(node.name)
+        self._push_scope('class', node.name)
 
         methods = [
             n for n in node.body
@@ -412,7 +1146,7 @@ class SemanticChecker(ast.NodeVisitor):
         if init_method:
             instance_vars = set()
             for stmt in ast.walk(init_method):
-                if isinstance(stmt, ast.Attribute):
+                if isinstance(stmt, ast.Attribute) and isinstance(stmt.ctx, ast.Store):
                     if isinstance(stmt.value, ast.Name) and stmt.value.id == 'self':
                         instance_vars.add(stmt.attr)
 
@@ -427,6 +1161,7 @@ class SemanticChecker(ast.NodeVisitor):
                 )
 
         self.generic_visit(node)
+        self._pop_scope()
         self.current_class = old_class
 
     # Exception Handling Checks
@@ -459,6 +1194,8 @@ class SemanticChecker(ast.NodeVisitor):
                     handler,
                     'EXC003',
                 )
+
+            self._check_lossy_raises(handler)
 
         self.generic_visit(node)
 
@@ -516,11 +1253,20 @@ class SemanticChecker(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import):
         """Check import statements."""
         for alias in node.names:
-            self.imported_names.add(alias.asname if alias.asname else alias.name)
+            bound = alias.asname if alias.asname else alias.name.split('.')[0]
+            self.imported_names.add(bound)
+            self._bind(bound, node, 'import')
+            if self._in_type_checking:
+                scope = self._current_scope()
+                if scope is not None:
+                    scope.used.add(bound)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         """Check from...import statements."""
+        if node.module == '__future__':
+            self.generic_visit(node)
+            return
         for alias in node.names:
             if alias.name == '*':
                 module = node.module if node.module is not None else '.'
@@ -532,18 +1278,117 @@ class SemanticChecker(ast.NodeVisitor):
                     'IMP001',
                 )
             else:
-                self.imported_names.add(alias.asname if alias.asname else alias.name)
+                bound = alias.asname if alias.asname else alias.name
+                self.imported_names.add(bound)
+                self._bind(bound, node, 'import')
+                if self._in_type_checking:
+                    scope = self._current_scope()
+                    if scope is not None:
+                        scope.used.add(bound)
+
+        if node.level and node.level >= 1 and self.known_exports:
+            self._check_relative_import(node)
 
         self.generic_visit(node)
+
+    def _check_relative_import(self, node: ast.ImportFrom) -> None:
+        target = resolve_relative_module(self.filename, node.level, node.module)
+        if target is None:
+            return
+        defined = self.known_exports.get(str(target))
+        if defined is None:
+            return
+        module_label = node.module or '.'
+        for alias in node.names:
+            if alias.name == '*':
+                continue
+            if alias.name not in defined:
+                self.add_issue(
+                    'error',
+                    'imports',
+                    f"Imported name '{alias.name}' is not defined in relative module '{module_label}'",
+                    node,
+                    'IMP003',
+                )
 
     def visit_Name(self, node: ast.Name):
         """Track variable usage."""
         if isinstance(node.ctx, ast.Load):
             self.used_names.add(node.id)
+            self._mark_used(node.id)
         elif isinstance(node.ctx, ast.Store):
             self.defined_names.add(node.id)
+            self._bind(node.id, node, 'assign')
+        elif isinstance(node.ctx, ast.Del):
+            self._mark_used(node.id)
 
         self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign):
+        self._record_constant_assign(node.targets, node.value)
+        self._record_dunder_all(node)
+        self.generic_visit(node)
+        if self._is_tainted_expr(node.value):
+            for target in node.targets:
+                self._mark_tainted_target(target)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        if node.value is not None:
+            self._record_constant_assign([node.target], node.value)
+        self.generic_visit(node)
+        if node.value is not None and self._is_tainted_expr(node.value):
+            self._mark_tainted_target(node.target)
+
+    def visit_If(self, node: ast.If):
+        type_checking = self._is_type_checking_test(node.test)
+        self.visit(node.test)
+        previous = self._in_type_checking
+        if type_checking:
+            self._in_type_checking = True
+        for stmt in node.body:
+            self.visit(stmt)
+        self._in_type_checking = previous
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+    def visit_Global(self, node: ast.Global):
+        scope = self._current_scope()
+        if scope is not None:
+            for name in node.names:
+                scope.global_names.add(name)
+        self.generic_visit(node)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal):
+        scope = self._current_scope()
+        if scope is not None:
+            for name in node.names:
+                scope.nonlocal_names.add(name)
+                self._mark_used(name)
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler):
+        if node.name:
+            scope = self._current_scope()
+            if scope is not None:
+                scope.used.add(node.name)
+        self.generic_visit(node)
+
+    def _visit_comprehension(self, node: ast.AST) -> None:
+        self._push_scope('comprehension')
+        self.generic_visit(node)
+        self._pop_scope()
+
+    def visit_ListComp(self, node: ast.ListComp):
+        self._visit_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp):
+        self._visit_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp):
+        self._visit_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp):
+        self._visit_comprehension(node)
 
     def visit_JoinedStr(self, node: ast.JoinedStr):
         self.generic_visit(node)
@@ -589,8 +1434,13 @@ class SemanticChecker(ast.NodeVisitor):
         try:
             tree = ast.parse(self.source_code, filename=self.filename)
             self._collect_imports(tree)
+            self.scopes = []
+            self._in_type_checking = False
+            self._with_expr_ids = set()
+            self._push_scope('module')
             self.visit(tree)
-            self.check_unused_imports()
+            self._pop_scope()
+            self.issues = [issue for issue in self.issues if not self._is_ignored(issue)]
             return sorted(self.issues, key=lambda x: (x.line, x.col, x.code))
         except SyntaxError as exc:
             return [Issue(
@@ -620,7 +1470,166 @@ def _io_issue(filepath: str, message: str) -> Issue:
     )
 
 
-def check_file(filepath: str, config: Optional[CheckerConfig] = None) -> List[Issue]:
+def collect_module_exports(source: str) -> Set[str]:
+    """Module-level names defined or re-exported in a file."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != '*':
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split('.')[0])
+    return names
+
+
+def resolve_relative_module(
+    importer: str,
+    level: int,
+    module: Optional[str],
+) -> Optional[Path]:
+    """Resolve a relative import to a .py file or package __init__.py."""
+    if level < 1 or not importer or importer == '<string>':
+        return None
+    try:
+        base = Path(importer).resolve().parent
+    except OSError:
+        return None
+    for _ in range(level - 1):
+        parent = base.parent
+        if parent == base:
+            return None
+        base = parent
+    candidate = base.joinpath(*module.split('.')) if module else base
+    pyfile = Path(str(candidate) + '.py')
+    init = candidate / '__init__.py'
+    if pyfile.is_file():
+        return pyfile.resolve()
+    if init.is_file():
+        return init.resolve()
+    return None
+
+
+def _normalize_issue_path(filename: str) -> str:
+    if not filename:
+        return ''
+    path = Path(filename)
+    try:
+        return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def issue_fingerprint(issue: Issue) -> str:
+    return f"{_normalize_issue_path(issue.filename)}|{issue.code}|{issue.message}"
+
+
+def load_baseline(path: str) -> Set[str]:
+    baseline_path = Path(path)
+    try:
+        raw = baseline_path.read_text(encoding='utf-8')
+        data = json.loads(raw)
+    except FileNotFoundError:
+        raise ConfigError(f"Baseline file '{path}' not found") from None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Could not read baseline '{path}': {exc}") from exc
+    fingerprints: Set[str] = set()
+    for item in data.get('issues') or []:
+        if not isinstance(item, dict):
+            continue
+        stored = item.get('fingerprint')
+        if stored:
+            fingerprints.add(str(stored))
+            continue
+        fingerprints.add(
+            f"{_normalize_issue_path(str(item.get('filename') or ''))}"
+            f"|{item.get('code') or ''}|{item.get('message') or ''}"
+        )
+    return fingerprints
+
+
+def write_baseline(issues: Sequence[Issue], path: str) -> None:
+    payload = {
+        'version': 1,
+        'issues': [
+            {
+                'filename': _normalize_issue_path(issue.filename),
+                'code': issue.code,
+                'message': issue.message,
+                'line': issue.line,
+                'fingerprint': issue_fingerprint(issue),
+            }
+            for issue in issues
+        ],
+    }
+    Path(path).write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+
+
+def git_staged_python_files() -> Tuple[List[str], Optional[str]]:
+    """Return staged *.py paths, or an error message."""
+    try:
+        completed = _subprocess.run(
+            ['git', 'diff', '--cached', '--name-only', '--diff-filter=ACMR'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, _subprocess.TimeoutExpired) as exc:
+        return [], f"Could not run git: {exc}"
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or 'git diff failed').strip()
+        return [], detail
+    files: List[str] = []
+    for line in completed.stdout.splitlines():
+        name = line.strip()
+        if name.endswith('.py') and Path(name).is_file():
+            files.append(name)
+    return files, None
+
+
+def expand_python_targets(paths: Sequence[str]) -> Tuple[List[str], List[Issue]]:
+    """Expand directories to .py files. Explicit files are kept as given."""
+    targets: List[str] = []
+    extras: List[Issue] = []
+    seen: Set[str] = set()
+
+    def _add(item: str) -> None:
+        if item not in seen:
+            seen.add(item)
+            targets.append(item)
+
+    for raw in paths:
+        path = Path(raw)
+        if path.is_dir():
+            found = [str(candidate) for candidate in iter_python_files(path)]
+            if not found:
+                extras.append(_io_issue(raw, f"No Python files found in '{raw}'"))
+                continue
+            for filepath in found:
+                _add(filepath)
+        else:
+            _add(raw)
+    return targets, extras
+
+
+def check_file(
+    filepath: str,
+    config: Optional[CheckerConfig] = None,
+    known_exports: Optional[Dict[str, Set[str]]] = None,
+) -> List[Issue]:
     """Check a Python file for semantic issues. I/O failures become IO001 errors."""
     path = Path(filepath)
     if not path.exists():
@@ -629,14 +1638,69 @@ def check_file(filepath: str, config: Optional[CheckerConfig] = None) -> List[Is
         return [_io_issue(filepath, f"'{filepath}' is not a file")]
 
     try:
-        source_code = path.read_text(encoding='utf-8')
+        source_code = read_python_source(path)
+    except LookupError as exc:
+        return [_io_issue(filepath, f"Unknown encoding in '{filepath}': {exc}")]
     except UnicodeDecodeError as exc:
-        return [_io_issue(filepath, f"Could not decode '{filepath}' as UTF-8: {exc}")]
+        return [_io_issue(filepath, f"Could not decode '{filepath}': {exc}")]
     except OSError as exc:
         return [_io_issue(filepath, f"Could not read '{filepath}': {exc}")]
 
-    checker = SemanticChecker(source_code, str(path), config=config)
+    checker = SemanticChecker(
+        source_code,
+        str(path),
+        config=config,
+        known_exports=known_exports,
+    )
     return checker.analyze()
+
+
+_BANDIT_SEVERITY = {
+    'HIGH': 'error',
+    'MEDIUM': 'warning',
+    'LOW': 'info',
+}
+
+
+def collect_bandit_issues(filepaths: Sequence[str]) -> List[Issue]:
+    """Run bandit if installed and convert findings to Issue objects."""
+    bandit_bin = shutil.which('bandit')
+    if not bandit_bin or not filepaths:
+        return []
+    try:
+        completed = _subprocess.run(
+            [bandit_bin, '-f', 'json', *filepaths],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, _subprocess.TimeoutExpired):
+        return []
+    payload = completed.stdout.strip()
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    issues: List[Issue] = []
+    for result in data.get('results') or []:
+        severity = _BANDIT_SEVERITY.get(
+            str(result.get('issue_severity', '')).upper(),
+            'warning',
+        )
+        test_id = str(result.get('test_id') or 'BANDIT')
+        issues.append(Issue(
+            severity=severity,
+            category='security',
+            message=str(result.get('issue_text') or test_id),
+            line=int(result.get('line_number') or 0),
+            col=int(result.get('col_offset') or 0),
+            code=test_id,
+            filename=str(result.get('filename') or ''),
+            source='bandit',
+        ))
+    return issues
 
 
 def _read_source_line(source: Optional[str], line: int) -> str:
@@ -660,9 +1724,10 @@ def format_issue(issue: Issue, source_line: str = '', use_color: bool = True) ->
     color_reset = reset if use_color else ''
     severity_str = issue.severity.upper()
 
+    origin = f" ({issue.source})" if issue.source and issue.source != 'codesnake' else ''
     output = (
         f"{color}{severity_str}{color_reset} [{issue.code}] "
-        f"{issue.category}: {issue.message}\n"
+        f"{issue.category}{origin}: {issue.message}\n"
     )
     location = f"Line {issue.line}, Column {issue.col}"
     if issue.filename:
@@ -675,6 +1740,8 @@ def format_issue(issue: Issue, source_line: str = '', use_color: bool = True) ->
         output += f"  {display}\n"
         if issue.col >= 0:
             output += f"  {' ' * issue.col}^\n"
+    if issue.suggestion:
+        output += f"  Suggestion: {issue.suggestion}\n"
 
     return output
 
@@ -720,6 +1787,10 @@ def _issue_to_dict(issue: Issue) -> dict:
         'line': issue.line,
         'col': issue.col,
         'filename': issue.filename,
+        'source': issue.source,
+        'end_line': issue.end_line,
+        'end_col': issue.end_col,
+        'suggestion': issue.suggestion,
     }
 
 
@@ -753,9 +1824,11 @@ def format_github_report(issues: Sequence[Issue]) -> str:
     for issue in issues:
         level = level_map.get(issue.severity, 'warning')
         file_part = issue.filename or ''
+        end = f",endLine={issue.end_line}" if issue.end_line and issue.end_line != issue.line else ''
+        suggestion = f" {issue.suggestion}" if issue.suggestion else ''
         lines.append(
-            f"::{level} file={file_part},line={issue.line},col={issue.col}"
-            f"::[{issue.code}] {issue.message}"
+            f"::{level} file={file_part},line={issue.line},col={issue.col}{end}"
+            f"::[{issue.code}] {issue.message}{suggestion}"
         )
     return '\n'.join(lines) + ('\n' if lines else '')
 
@@ -778,16 +1851,23 @@ def format_sarif_report(issues: Sequence[Issue], tool_version: str) -> str:
     for issue in issues:
         start_line = issue.line if issue.line > 0 else 1
         start_col = issue.col if issue.col > 0 else 1
+        end_line = issue.end_line if issue.end_line > 0 else start_line
+        end_col = issue.end_col if issue.end_col > 0 else start_col
+        message_text = issue.message
+        if issue.suggestion:
+            message_text = f"{issue.message} Suggestion: {issue.suggestion}"
         results.append({
             'ruleId': issue.code,
             'level': level_map.get(issue.severity, 'warning'),
-            'message': {'text': issue.message},
+            'message': {'text': message_text},
             'locations': [{
                 'physicalLocation': {
                     'artifactLocation': {'uri': issue.filename or ''},
                     'region': {
                         'startLine': start_line,
                         'startColumn': start_col,
+                        'endLine': end_line,
+                        'endColumn': max(end_col, 1),
                     },
                 },
             }],
@@ -866,6 +1946,10 @@ def run_check(
     show_banner: bool = False,
     color: Optional[bool] = None,
     stream: Optional[TextIO] = None,
+    use_bandit: Optional[bool] = None,
+    staged: bool = False,
+    baseline_path: Optional[str] = None,
+    update_baseline: Optional[str] = None,
 ) -> int:
     """Analyze one or more files. Returns 1 if any error-severity issue exists."""
     out = stream if stream is not None else sys.stdout
@@ -877,25 +1961,106 @@ def run_check(
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    if not files:
+    file_list = list(files)
+    if staged:
+        staged_files, git_error = git_staged_python_files()
+        if git_error:
+            print(f"Error: {git_error}", file=sys.stderr)
+            return 1
+        if not staged_files:
+            print("No staged Python files.", file=sys.stderr)
+            return 0
+        file_list = staged_files
+
+    if not file_list:
         print("Error: no files to check", file=sys.stderr)
         return 1
 
     if show_banner and output_format == 'text':
         _print_banner()
 
+    targets, extra_issues = expand_python_targets(file_list)
+
     file_reports: List[Tuple[str, List[Issue], Optional[str]]] = []
-    for filepath in files:
+    for extra in extra_issues:
+        filtered = filter_issues([extra], config, min_severity=min_severity)
+        file_reports.append((extra.filename or '', filtered, None))
+
+    sources_by_file: Dict[str, str] = {}
+    known_exports: Dict[str, Set[str]] = {}
+    for filepath in targets:
         path = Path(filepath)
-        source: Optional[str] = None
-        if path.is_file():
-            try:
-                source = path.read_text(encoding='utf-8')
-            except (OSError, UnicodeDecodeError):
-                source = None
-        issues = check_file(filepath, config=config)
+        if not path.is_file():
+            continue
+        try:
+            source = read_python_source(path)
+        except (OSError, UnicodeDecodeError, LookupError):
+            continue
+        sources_by_file[filepath] = source
+        try:
+            known_exports[str(path.resolve())] = collect_module_exports(source)
+        except OSError:
+            known_exports[filepath] = collect_module_exports(source)
+
+    for filepath in targets:
+        source = sources_by_file.get(filepath)
+        issues = check_file(filepath, config=config, known_exports=known_exports)
         issues = filter_issues(issues, config, min_severity=min_severity)
         file_reports.append((filepath, issues, source))
+
+    run_bandit = config.use_bandit if use_bandit is None else use_bandit
+    if run_bandit and targets:
+        if shutil.which('bandit') is None:
+            print(
+                "Warning: --bandit requested but the 'bandit' executable was not found",
+                file=sys.stderr,
+            )
+        else:
+            bandit_issues = collect_bandit_issues(targets)
+            by_file: Dict[str, List[Issue]] = {}
+            for issue in bandit_issues:
+                by_file.setdefault(os.path.abspath(issue.filename), []).append(issue)
+            for index, (filepath, issues, source) in enumerate(file_reports):
+                extra = by_file.get(os.path.abspath(filepath), [])
+                if source:
+                    lines = source.split('\n')
+                    kept = []
+                    for issue in extra:
+                        if issue.line <= 0 or issue.line > len(lines):
+                            kept.append(issue)
+                            continue
+                        codes = ignored_codes_on_line(lines[issue.line - 1])
+                        if codes is None:
+                            kept.append(issue)
+                        elif codes and issue.code.upper() not in codes:
+                            kept.append(issue)
+                    extra = kept
+                extra = filter_issues(extra, config, min_severity=min_severity)
+                if extra:
+                    file_reports[index] = (filepath, issues + extra, source)
+
+    if update_baseline:
+        snapshot = [issue for _, issues, _ in file_reports for issue in issues]
+        try:
+            write_baseline(snapshot, update_baseline)
+        except OSError as exc:
+            print(f"Error: could not write baseline '{update_baseline}': {exc}", file=sys.stderr)
+            return 1
+
+    if baseline_path:
+        try:
+            fingerprints = load_baseline(baseline_path)
+        except ConfigError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        file_reports = [
+            (
+                filepath,
+                [issue for issue in issues if issue_fingerprint(issue) not in fingerprints],
+                source,
+            )
+            for filepath, issues, source in file_reports
+        ]
 
     displayed: List[Tuple[str, List[Issue]]] = [
         (path, issues) for path, issues, _ in file_reports
@@ -926,7 +2091,7 @@ def run_check(
                 if not rendered.endswith('\n'):
                     out.write('\n')
                 out.write('\n')
-        if any_issues or len(files) > 1:
+        if any_issues or len(file_reports) > 1:
             out.write(
                 f"\nSummary: {errors} errors, {warnings} warnings, {infos} info\n"
             )
@@ -939,7 +2104,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog='codesnake',
         description='CodeSnake - Semantic Code Checker for Python 3',
     )
-    parser.add_argument('files', nargs='*', help='Python files to check')
+    parser.add_argument('files', nargs='*', help='Python files or directories to check')
     parser.add_argument('--config', help='Path to .codesnake.json')
     parser.add_argument(
         '--format',
@@ -953,6 +2118,22 @@ def build_parser() -> argparse.ArgumentParser:
         help='Minimum severity to report',
     )
     parser.add_argument('--no-color', action='store_true', help='Disable ANSI colors')
+    parser.add_argument(
+        '--bandit',
+        action='store_true',
+        help='Merge findings from the bandit security scanner if it is installed',
+    )
+    parser.add_argument(
+        '--staged',
+        action='store_true',
+        help='Check only Python files staged in git',
+    )
+    parser.add_argument('--baseline', help='Ignore issues listed in this baseline JSON file')
+    parser.add_argument(
+        '--update-baseline',
+        metavar='FILE',
+        help='Write current findings to a baseline JSON file',
+    )
     parser.add_argument('--version', action='store_true', help='Show version and exit')
     parser.add_argument('--banner', action='store_true', help='Show banner and exit')
     return parser
@@ -971,7 +2152,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _print_version()
         return 0
 
-    if not args.files:
+    if not args.files and not args.staged:
         parser.print_help()
         return 1
 
@@ -982,6 +2163,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_severity=args.severity,
         show_banner=(args.format == 'text'),
         color=False if args.no_color else None,
+        use_bandit=True if args.bandit else None,
+        staged=args.staged,
+        baseline_path=args.baseline,
+        update_baseline=args.update_baseline,
     )
 
 

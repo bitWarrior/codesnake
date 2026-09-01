@@ -20,7 +20,12 @@ from codesnake import (
     CheckerConfig,
     SemanticChecker,
     check_file,
+    expand_python_targets,
+    issue_fingerprint,
+    load_baseline,
+    read_python_source,
     run_check,
+    write_baseline,
 )
 
 
@@ -36,11 +41,22 @@ result = eval(user_input)
         checker = SemanticChecker(code)
         issues = checker.analyze()
         
-        # Should find SEC001 error
+        # Constant argument is still flagged, at info (not untrusted input)
+        sec_issues = [i for i in issues if i.code == 'SEC001']
+        self.assertEqual(len(sec_issues), 1)
+        self.assertEqual(sec_issues[0].severity, 'info')
+        self.assertIn('eval', sec_issues[0].message)
+
+    def test_eval_tainted_input_is_error(self):
+        code = """
+user_input = input()
+result = eval(user_input)
+"""
+        issues = SemanticChecker(code).analyze()
         sec_issues = [i for i in issues if i.code == 'SEC001']
         self.assertEqual(len(sec_issues), 1)
         self.assertEqual(sec_issues[0].severity, 'error')
-        self.assertIn('eval', sec_issues[0].message)
+        self.assertIn('untrusted', sec_issues[0].message)
     
     def test_exec_detection(self):
         """Test that exec() usage is detected."""
@@ -524,18 +540,26 @@ class TestFailClosed(unittest.TestCase):
         self.assertIn('not found', output.lower())
         self.assertNotIn('No issues found', output)
 
-    def test_directory_returns_io001(self):
+    def test_directory_returns_io001_for_check_file(self):
         issues = check_file('.')
         self.assertTrue(issues)
         self.assertEqual(issues[0].code, 'IO001')
-        self.assertEqual(run_check(
-            ['.'],
-            config=CheckerConfig(),
-            output_format='json',
-            show_banner=False,
-            color=False,
-            stream=StringIO(),
-        ), 1)
+
+    def test_empty_directory_run_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = StringIO()
+            rc = run_check(
+                [tmp],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertIn('IO001', codes)
 
     def test_syntax_error_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -562,7 +586,7 @@ class TestCLIOutput(unittest.TestCase):
     def test_json_format_contains_sec001(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'bad.py'
-            path.write_text('eval(1)\n', encoding='utf-8')
+            path.write_text('eval(input())\n', encoding='utf-8')
             buf = StringIO()
             rc = run_check(
                 [str(path)],
@@ -583,7 +607,7 @@ class TestCLIOutput(unittest.TestCase):
             clean = Path(tmp) / 'clean.py'
             dirty = Path(tmp) / 'dirty.py'
             clean.write_text('x = 1\n', encoding='utf-8')
-            dirty.write_text('eval(1)\n', encoding='utf-8')
+            dirty.write_text('eval(input())\n', encoding='utf-8')
             buf = StringIO()
             rc = run_check(
                 [str(clean), str(dirty)],
@@ -633,7 +657,7 @@ class TestCLIOutput(unittest.TestCase):
     def test_github_and_sarif_formats_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'bad.py'
-            path.write_text('eval(1)\n', encoding='utf-8')
+            path.write_text('eval(input())\n', encoding='utf-8')
             for fmt in ('github', 'sarif'):
                 buf = StringIO()
                 rc = run_check(
@@ -646,6 +670,563 @@ class TestCLIOutput(unittest.TestCase):
                 )
                 self.assertEqual(rc, 1)
                 self.assertIn('SEC001', buf.getvalue())
+
+
+class TestUnusedAndScopes(unittest.TestCase):
+    """Unused imports/locals/args, shadowing, and COMP005 stores."""
+
+    def test_unused_import(self):
+        code = "import os\nx = 1\n"
+        issues = SemanticChecker(code).analyze()
+        unused = [i for i in issues if i.code == 'IMP002']
+        self.assertEqual(len(unused), 1)
+        self.assertIn("'os'", unused[0].message)
+
+    def test_used_import_not_flagged(self):
+        code = "import os\nprint(os.name)\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+    def test_import_os_path_used_via_os(self):
+        code = "import os.path\nprint(os.name)\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+    def test_type_checking_import_not_flagged(self):
+        code = """
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from collections import Counter
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+    def test_dunder_all_marks_export_used(self):
+        code = """
+from json import dumps
+__all__ = ['dumps']
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+    def test_unused_local_and_argument(self):
+        code = """
+def func(unused_arg):
+    hidden = 1
+    return 2
+"""
+        issues = SemanticChecker(code).analyze()
+        codes = {i.code for i in issues}
+        self.assertIn('VAR001', codes)
+        self.assertIn('VAR002', codes)
+
+    def test_underscore_and_self_not_flagged(self):
+        code = """
+def method(self, _skip, used):
+    return used
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code in ('VAR001', 'VAR002')], [])
+
+    def test_closure_uses_outer_name(self):
+        code = """
+def outer():
+    captured = 1
+    def inner():
+        return captured
+    return inner
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'VAR001'], [])
+
+    def test_shadowing_enclosing_function(self):
+        code = """
+def outer():
+    value = 1
+    def inner():
+        value = 2
+        return value
+    return inner
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'VAR003']), 1)
+
+    def test_comp005_ignores_method_calls(self):
+        code = """
+class C:
+    def __init__(self):
+        self.setup()
+        self.helper()
+        self.a = 1
+        self.b = 2
+        self.c = 3
+        self.d = 4
+        self.e = 5
+        self.f = 6
+        self.g = 7
+        self.h = 8
+        self.i = 9
+        self.j = 10
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'COMP005'], [])
+
+    def test_comp005_counts_only_stores(self):
+        code = """
+class C:
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+        self.c = 3
+        self.d = 4
+        self.e = 5
+        self.f = 6
+        self.g = 7
+        self.h = 8
+        self.i = 9
+        self.j = 10
+        self.k = 11
+"""
+        issues = SemanticChecker(code, config=CheckerConfig(max_instance_vars=10)).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'COMP005']), 1)
+
+    def test_noqa_all_on_line(self):
+        code = "eval('1')  # noqa\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'SEC001'], [])
+
+    def test_noqa_specific_code(self):
+        code = "eval('1')  # noqa: SEC001\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'SEC001'], [])
+
+    def test_noqa_does_not_suppress_other_codes(self):
+        code = "eval('1')  # noqa: IMP002\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC001']), 1)
+
+    def test_codesnake_ignore_pragma(self):
+        code = "import os  # codesnake: ignore=IMP002\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+
+class TestDirectoryWalkAndEncoding(unittest.TestCase):
+    """Directory expansion, gitignore, encoding cookies, shell constants."""
+
+    def test_directory_walk_finds_nested_python(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'pkg').mkdir()
+            (root / 'pkg' / 'mod.py').write_text('x = 1\n', encoding='utf-8')
+            (root / '__pycache__').mkdir()
+            (root / '__pycache__' / 'skip.py').write_text('eval(1)\n', encoding='utf-8')
+            targets, extras = expand_python_targets([str(root)])
+            self.assertEqual(extras, [])
+            self.assertEqual(len(targets), 1)
+            self.assertTrue(targets[0].endswith('mod.py'))
+
+    def test_gitignore_skips_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '.gitignore').write_text('ignored.py\nsecret/\n', encoding='utf-8')
+            (root / 'kept.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'ignored.py').write_text('eval(1)\n', encoding='utf-8')
+            (root / 'secret').mkdir()
+            (root / 'secret' / 'bad.py').write_text('eval(1)\n', encoding='utf-8')
+            targets, extras = expand_python_targets([str(root)])
+            self.assertEqual(extras, [])
+            names = {Path(path).name for path in targets}
+            self.assertEqual(names, {'kept.py'})
+
+    def test_run_check_on_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'a.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'b.py').write_text('eval(input())\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(root)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data['summary']['files'], 2)
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertIn('SEC001', codes)
+
+    def test_encoding_cookie(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'latin.py'
+            path.write_bytes(b'# coding: latin-1\ncafe = "caf\xe9"\n')
+            text = read_python_source(path)
+            self.assertIn('caf', text)
+            issues = check_file(str(path), config=CheckerConfig())
+            self.assertEqual([i.code for i in issues if i.code == 'IO001'], [])
+
+    def test_shell_true_via_local_constant(self):
+        code = """
+import subprocess
+shell = True
+subprocess.run("ls", shell=shell)
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC003']), 1)
+
+    def test_shell_false_constant_not_flagged(self):
+        code = """
+import subprocess
+shell = False
+subprocess.run("ls", shell=shell)
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'SEC003'], [])
+
+    def test_shell_true_constant_inside_function(self):
+        code = """
+import subprocess
+def run_it():
+    use_shell = True
+    subprocess.call("ls", shell=use_shell)
+run_it()
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC003']), 1)
+
+
+class TestResourceAndPatternChecks(unittest.TestCase):
+    """open-without-with, lossy except, duplicate keys, async without await."""
+
+    def test_open_without_with(self):
+        code = "f = open('x.txt')\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'RES001']), 1)
+
+    def test_open_with_context_manager_ok(self):
+        code = "with open('x.txt') as handle:\n    handle.read()\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'RES001'], [])
+
+    def test_lossy_except_raise(self):
+        code = """
+try:
+    risky()
+except Exception as exc:
+    raise RuntimeError('failed')
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'EXC005']), 1)
+
+    def test_raise_from_not_lossy(self):
+        code = """
+try:
+    risky()
+except Exception as exc:
+    raise RuntimeError('failed') from exc
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'EXC005'], [])
+
+    def test_reraise_same_exception_ok(self):
+        code = """
+try:
+    risky()
+except Exception as exc:
+    raise exc
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'EXC005'], [])
+
+    def test_duplicate_dict_keys(self):
+        code = "data = {'a': 1, 'a': 2}\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'BUG002']), 1)
+
+    def test_async_without_await(self):
+        code = """
+async def fetch():
+    return 1
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'ASY001']), 1)
+
+    def test_async_with_await_ok(self):
+        code = """
+async def fetch():
+    return await other()
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'ASY001'], [])
+
+    def test_abstract_async_not_flagged(self):
+        code = """
+from abc import abstractmethod
+class Base:
+    @abstractmethod
+    async def fetch(self):
+        ...
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'ASY001'], [])
+
+
+class TestTaintAndBandit(unittest.TestCase):
+    """Taint-lite for eval/subprocess and optional bandit merge."""
+
+    def test_eval_fstring_tainted(self):
+        code = """
+name = input()
+eval(f'id_{name}')
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC001']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'error')
+
+    def test_subprocess_tainted_shell_is_error(self):
+        code = """
+import subprocess
+cmd = input()
+subprocess.run(cmd, shell=True)
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC003']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'error')
+
+    def test_subprocess_tainted_without_shell(self):
+        code = """
+import subprocess
+cmd = input()
+subprocess.run(cmd)
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC004']), 1)
+
+    def test_request_args_taint(self):
+        code = """
+def view(request):
+    eval(request.args['q'])
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC001']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'error')
+
+    def test_bandit_merge(self):
+        from codesnake import collect_bandit_issues, Issue as IssueType
+        from unittest.mock import patch
+
+        fake = {
+            'results': [{
+                'issue_severity': 'HIGH',
+                'test_id': 'B602',
+                'issue_text': 'subprocess with shell=True',
+                'line_number': 3,
+                'col_offset': 0,
+                'filename': '/tmp/fake.py',
+            }],
+        }
+        with patch('codesnake.shutil.which', return_value='/usr/bin/bandit'):
+            with patch('codesnake._subprocess.run') as run:
+                run.return_value.stdout = json.dumps(fake)
+                run.return_value.returncode = 1
+                found = collect_bandit_issues(['/tmp/fake.py'])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].code, 'B602')
+        self.assertEqual(found[0].source, 'bandit')
+        self.assertEqual(found[0].severity, 'error')
+        self.assertIsInstance(found[0], IssueType)
+
+
+class TestCrossFileAndBaseline(unittest.TestCase):
+    """Relative import graph, baseline, --staged, end_line, suggestions."""
+
+    def test_relative_import_missing_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / 'pkg'
+            pkg.mkdir()
+            (pkg / 'b.py').write_text('def exists():\n    return 1\n', encoding='utf-8')
+            (pkg / 'a.py').write_text('from .b import missing\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(pkg / 'a.py'), str(pkg / 'b.py')],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertIn('IMP003', codes)
+
+    def test_relative_import_defined_name_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / 'pkg'
+            pkg.mkdir()
+            (pkg / 'b.py').write_text('def exists():\n    return 1\n', encoding='utf-8')
+            (pkg / 'a.py').write_text('from .b import exists\nprint(exists())\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(pkg / 'a.py'), str(pkg / 'b.py')],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertNotIn('IMP003', codes)
+            self.assertEqual(rc, 0)
+
+    def test_relative_import_skipped_if_sibling_not_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / 'pkg'
+            pkg.mkdir()
+            (pkg / 'b.py').write_text('def exists():\n    return 1\n', encoding='utf-8')
+            importer = pkg / 'a.py'
+            importer.write_text('from .b import missing\n', encoding='utf-8')
+            issues = check_file(str(importer), config=CheckerConfig())
+            self.assertEqual([i.code for i in issues if i.code == 'IMP003'], [])
+
+    def test_end_line_and_suggestion_on_eval(self):
+        issues = SemanticChecker('eval(input())\n').analyze()
+        sec = [i for i in issues if i.code == 'SEC001']
+        self.assertTrue(sec)
+        self.assertGreaterEqual(sec[0].end_line, sec[0].line)
+        self.assertIn('literal_eval', sec[0].suggestion)
+
+    def test_baseline_hides_known_issues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.py'
+            path.write_text('eval(input())\n', encoding='utf-8')
+            baseline = Path(tmp) / 'baseline.json'
+            buf = StringIO()
+            rc = run_check(
+                [str(path)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+                update_baseline=str(baseline),
+            )
+            self.assertEqual(rc, 1)
+            self.assertTrue(baseline.is_file())
+            loaded = load_baseline(str(baseline))
+            self.assertTrue(loaded)
+
+            buf2 = StringIO()
+            rc2 = run_check(
+                [str(path)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf2,
+                baseline_path=str(baseline),
+            )
+            self.assertEqual(rc2, 0)
+            data = json.loads(buf2.getvalue())
+            remaining = [i for f in data['files'] for i in f['issues']]
+            self.assertEqual(remaining, [])
+
+    def test_baseline_reports_new_issue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.py'
+            path.write_text('x = 1\n', encoding='utf-8')
+            baseline = Path(tmp) / 'baseline.json'
+            write_baseline([], str(baseline))
+            path.write_text('eval(input())\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(path)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+                baseline_path=str(baseline),
+            )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertIn('SEC001', codes)
+
+    def test_missing_baseline_fails_closed(self):
+        rc = run_check(
+            ['whatever.py'],
+            config=CheckerConfig(),
+            output_format='json',
+            show_banner=False,
+            color=False,
+            stream=StringIO(),
+            baseline_path='/no/such/baseline.json',
+        )
+        self.assertEqual(rc, 1)
+
+    def test_staged_uses_git_list(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'staged.py'
+            path.write_text('eval(input())\n', encoding='utf-8')
+            buf = StringIO()
+            with patch('codesnake.git_staged_python_files', return_value=([str(path)], None)):
+                rc = run_check(
+                    [],
+                    config=CheckerConfig(),
+                    output_format='json',
+                    show_banner=False,
+                    color=False,
+                    stream=buf,
+                    staged=True,
+                )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertIn('SEC001', codes)
+
+    def test_staged_no_files_exits_zero(self):
+        from unittest.mock import patch
+
+        with patch('codesnake.git_staged_python_files', return_value=([], None)):
+            rc = run_check(
+                [],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=StringIO(),
+                staged=True,
+            )
+        self.assertEqual(rc, 0)
+
+    def test_json_includes_end_line_and_suggestion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.py'
+            path.write_text('eval(input())\n', encoding='utf-8')
+            buf = StringIO()
+            run_check(
+                [str(path)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            data = json.loads(buf.getvalue())
+            issue = data['files'][0]['issues'][0]
+            self.assertIn('end_line', issue)
+            self.assertIn('suggestion', issue)
+            self.assertTrue(issue['suggestion'])
 
 
 def run_tests():
