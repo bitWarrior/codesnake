@@ -33,6 +33,16 @@ Consider claiming the name with a release to [TestPyPI](https://test.pypi.org) f
 4. Publish a GitHub Release on that tag with notes. Publishing is what starts the workflow.
 5. Approve the `pypi` deployment when GitHub asks.
 
+If the release event does not start a run, or a publish failed and you want to retry
+without recreating the Release, dispatch it manually with the same tag:
+
+```bash
+gh workflow run release.yml -f tag=v1.3.0
+```
+
+Both paths run the identical build, the identical tag/version guard, and the same
+environment approval.
+
 The build job refuses to publish when the release tag and `_version.py` disagree, so a `v1.3.0` tag cannot ship a `1.2.0` artifact.
 
 ## What protects the release path
