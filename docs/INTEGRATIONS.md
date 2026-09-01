@@ -58,8 +58,8 @@ jobs:
   codesnake:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install "git+https://github.com/bitWarrior/codesnake@v1.1.0"
@@ -77,7 +77,7 @@ Upload SARIF so findings appear under **Security → Code scanning**. The `|| tr
     steps:
       # ... checkout / setup-python / install as above
       - run: codesnake check --format sarif --no-color src/ > codesnake.sarif || true
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: codesnake.sarif
       - run: codesnake check --severity error --no-color src/
