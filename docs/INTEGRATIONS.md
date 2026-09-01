@@ -5,11 +5,13 @@ Recipes for running CodeSnake automatically. They assume an install (`pip instal
 Two facts shape every recipe:
 
 - The **exit code is 1 only for error-severity findings** (plus I/O, syntax, config, and git failures). Warnings and info never fail a run. There is no `--fail-on warning` flag yet; if you need that, parse `--format json` and look at `summary.warnings`.
-- Output paths are printed **as you passed them**, so run from the repository root with relative paths when a tool needs to map findings back to files.
+- **Paths depend on the format.** `--format github` and `--format sarif` emit paths relative to the working directory, so run them from the repository root and the locations will match the checkout. The `text` and `json` formats print paths as you passed them for explicit file arguments, but resolved *absolute* paths when you pass a directory — parse with that in mind.
 
 ## Git pre-commit hook
 
 `--staged` asks git for the staged `*.py` files itself and works from any directory inside the repository. With nothing staged it exits 0.
+
+It reads those files **from the working tree**, not from the staged blobs, so with a partial `git add -p` — or an edit made after staging — the hook judges code that is not being committed. The pre-commit framework below avoids this by stashing unstaged changes.
 
 `.git/hooks/pre-commit`:
 
@@ -90,11 +92,13 @@ codesnake check --update-baseline .codesnake-baseline.json src/
 git add .codesnake-baseline.json
 ```
 
+Baselines store paths relative to the working directory, so write and read them from the **same** directory — the repository root, to match CI. A baseline recorded at the root suppresses nothing when the check is later run from inside `src/`. (This is why `--baseline` does not belong in the `--staged` hook above without pinning the directory first.)
+
 ```yaml
       - run: codesnake check --baseline .codesnake-baseline.json --format github --no-color src/
 ```
 
-Fingerprints ignore line numbers and numeric counts in messages, so refactors and moved code do not re-fail CI; a *new* violation (including a second identical one in the same file) does. Refresh the baseline with `--update-baseline` as you pay down the backlog.
+A fingerprint is the file path, the rule code, the message with digits normalized away, and an occurrence index. Line numbers and numeric counts therefore do not matter — edits above a finding, or a complexity score drifting from 15 to 16, will not re-fail CI. Anything else does: moving code to another file, or a rename that changes an identifier quoted in the message (`Unused import 'os'`), mints a new fingerprint even though the finding is unchanged. A genuinely *new* violation (including a second identical one in the same file) fails too. Refresh the baseline with `--update-baseline` as you pay down the backlog.
 
 ## Other CI systems
 
@@ -108,7 +112,7 @@ Per-file issues live under `files[].issues[]`; totals under `summary`. Set `NO_C
 
 ## VS Code
 
-`.vscode/tasks.json` — a task whose problem matcher reads the `github` format, so findings land in the Problems panel and are clickable. VS Code's matcher understands only `error`/`warning`/`info` severities, so pass `--severity warning` to drop `notice` lines.
+`.vscode/tasks.json` — a task whose problem matcher reads the `github` format, so findings land in the Problems panel and are clickable. VS Code's matcher understands only `error`/`warning`/`info` severities, so pass `--severity warning` to drop `notice` lines. `"fileLocation": "autoDetect"` resolves both the relative paths the `github` format emits under `cwd` and any absolute path that comes back from outside it.
 
 ```json
 {
@@ -122,7 +126,7 @@ Per-file issues live under `files[].issues[]`; totals under `summary`. Set `NO_C
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": {
         "owner": "codesnake",
-        "fileLocation": ["relative", "${workspaceFolder}"],
+        "fileLocation": "autoDetect",
         "pattern": {
           "regexp": "^::(error|warning) file=([^,]+),line=(\\d+),col=(\\d+).*::(.*)$",
           "severity": 1,
@@ -194,4 +198,4 @@ CodeSnake's differentiators are the taint tracking behind SEC001/SEC003 severiti
 | `No staged Python files.` | Nothing staged, or the files are not `*.py`; a real git failure prints an `Error:` instead |
 | Escape codes in CI logs | `--no-color` or `NO_COLOR=1` |
 | Warnings don't fail the build | By design; see the exit-code note at the top |
-| `[tool.codesnake]` ignored | Reading TOML needs Python 3.11+; on 3.10 a warning is printed and `.codesnake.json` is used |
+| `[tool.codesnake]` ignored | Reading TOML needs Python 3.11+; on 3.10 a warning is printed and discovery continues upward — the nearest `.codesnake.json` wins, or the built-in defaults if there is none |

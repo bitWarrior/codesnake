@@ -8,7 +8,7 @@ Three Bash scripts wrap the `codesnake` CLI for people who would rather not mana
 | `codesnake.sh` | Daily use: activate the venv (creating it if missing) and run the CLI |
 | `codesnake-launcher.sh` | You also want `--test`, `--create-venv`, or `--no-venv` |
 
-All three detect `python3` (falling back to `python`) and make the package importable with `PYTHONPATH=src`, so they work from a bare checkout as well as after an install.
+`codesnake.sh` and `codesnake-launcher.sh` detect `python3` (falling back to `python`) and make the package importable with `PYTHONPATH=src`, so they work from a bare checkout as well as after an install. `setup.sh` requires an interpreter named `python3` on `PATH` and aborts without one — on a host where Python 3 is installed only as `python`, create the venv yourself (`python -m venv codesnake-venv`) and skip it.
 
 ## `setup.sh`
 

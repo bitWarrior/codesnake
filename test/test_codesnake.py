@@ -2231,6 +2231,18 @@ class TestReportFormatting(unittest.TestCase):
         self.assertIn(',endColumn=10,', out)
         self.assertIn('title=SEC003 security', out)
 
+    def test_github_paths_are_workspace_relative(self):
+        from codesnake import format_github_report
+        from codesnake.checker import _gh_escape_property
+        cwd = Path.cwd().resolve()
+        inside = cwd / 'src' / 'codesnake' / 'checker.py'
+        out = format_github_report([self._issue(filename=str(inside))])
+        self.assertIn('file=src/codesnake/checker.py,', out)
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp).resolve() / 'x.py'
+            out = format_github_report([self._issue(filename=str(outside))])
+        self.assertIn(f'file={_gh_escape_property(outside.as_posix())},', out)
+
     def test_sarif_metadata_and_uris(self):
         from codesnake import format_sarif_report
         with tempfile.TemporaryDirectory() as tmp:

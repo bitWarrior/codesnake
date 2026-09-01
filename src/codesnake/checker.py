@@ -2343,7 +2343,7 @@ def format_github_report(issues: Sequence[Issue]) -> str:
     level_map = {'error': 'error', 'warning': 'warning', 'info': 'notice'}
     for issue in issues:
         level = level_map.get(issue.severity, 'warning')
-        props = [f"file={_gh_escape_property(issue.filename or '')}", f"line={issue.line}"]
+        props = [f"file={_gh_escape_property(_gh_path(issue.filename))}", f"line={issue.line}"]
         col = issue.col + 1 if issue.col >= 0 else 1
         props.append(f"col={col}")
         if issue.end_line and issue.end_line != issue.line:
@@ -2358,22 +2358,53 @@ def format_github_report(issues: Sequence[Issue]) -> str:
     return '\n'.join(lines) + ('\n' if lines else '')
 
 
+def _relative_to_cwd(filename: str) -> Optional[str]:
+    """POSIX path relative to the current directory, or ``None`` if outside it.
+
+    Directory arguments are walked resolved (see :func:`iter_python_files`), so
+    issue filenames are absolute even when the user passed a relative path.
+    Report formats that are consumed relative to a workspace root have to undo
+    that before emitting a location.
+    """
+    if not filename:
+        return None
+    try:
+        resolved = Path(filename).resolve()
+    except OSError:
+        return None
+    try:
+        return resolved.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _gh_path(filename: str) -> str:
+    """Workspace-relative POSIX path for a ``file=`` annotation property.
+
+    GitHub resolves ``file=`` against the workspace root and silently drops
+    annotations whose path does not match a file there, so an absolute path
+    would never attach to the diff.
+    """
+    if not filename:
+        return ''
+    relative = _relative_to_cwd(filename)
+    if relative is not None:
+        return relative
+    return Path(filename).as_posix()
+
+
 def _sarif_uri(filename: str) -> str:
     """Relative POSIX path under cwd, otherwise an absolute ``file://`` URI."""
     if not filename:
         return ''
     path = Path(filename)
+    relative = _relative_to_cwd(filename)
+    if relative is not None:
+        return relative
     try:
-        resolved = path.resolve()
-    except OSError:
+        return path.resolve().as_uri()
+    except (OSError, ValueError):
         return path.as_posix()
-    try:
-        return resolved.relative_to(Path.cwd().resolve()).as_posix()
-    except ValueError:
-        try:
-            return resolved.as_uri()
-        except ValueError:
-            return path.as_posix()
 
 
 def format_sarif_report(issues: Sequence[Issue], tool_version: str) -> str:
