@@ -28,16 +28,16 @@ The banner automatically displays when you run:
 
 ```bash
 # Main checker
-python codesnake.py your_code.py
+codesnake check your_code.py
 
 # Enhanced version
-python codesnake_enhanced.py your_code.py
+codesnake check your_code.py
 
 # CLI tool
-python codesnake_cli.py check your_code.py
+codesnake check your_code.py
 
 # Show banner explicitly
-python codesnake_cli.py --banner
+codesnake --banner
 ```
 
 ### Demo All Banners
@@ -45,7 +45,6 @@ python codesnake_cli.py --banner
 Run the demo script to see all available banners:
 
 ```bash
-python demo_banner.py
 ```
 
 This will show:
@@ -56,10 +55,10 @@ This will show:
 
 ### Customization
 
-The banner code is in `codesnake_banner.py`:
+The banner code is in `src/codesnake/banner.py`:
 
 ```python
-from codesnake_banner import print_snake_banner
+from codesnake.banner import print_snake_banner
 
 # Display the banner
 print_snake_banner()
@@ -92,10 +91,10 @@ If you need plain text output (e.g., for logs):
 
 ```bash
 # The enhanced version supports --no-color
-python codesnake_enhanced.py --no-color your_code.py
+codesnake check --no-color your_code.py
 
 # Or redirect to a file (colors auto-disabled in most terminals)
-python codesnake.py your_code.py > output.txt
+codesnake check your_code.py > output.txt
 ```
 
 ### Banner Function
@@ -112,7 +111,6 @@ def print_snake_banner():
 ## All Available ASCII Art
 
 ### 1. Main Banner (Colorful)
-Used by: `codesnake.py`, `codesnake_enhanced.py`, `codesnake_cli.py`
 
 ### 2. Small Snake
 ```
@@ -135,12 +133,12 @@ Simple: `🐍 CodeSnake`
 
 ### Display Banner Only
 ```bash
-python codesnake_cli.py --banner
+codesnake --banner
 ```
 
 ### In Your Own Scripts
 ```python
-from codesnake_banner import print_snake_banner, print_version
+from codesnake.banner import print_snake_banner, print_version
 
 print_snake_banner()  # Show the main banner
 print_version()       # Show version info
@@ -150,7 +148,7 @@ print_version()       # Show version info
 Currently the banner displays automatically. To suppress it, you could modify the code or redirect stderr:
 
 ```bash
-python codesnake.py your_code.py 2>/dev/null
+codesnake check your_code.py 2>/dev/null
 ```
 
 ## Why a Banner?

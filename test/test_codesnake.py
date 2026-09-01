@@ -13,7 +13,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 
-# Add src directory to path to import codesnake
+# Add src/ to the path so the codesnake package imports without an install
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from codesnake import (
@@ -1031,8 +1031,8 @@ def view(request):
                 'filename': '/tmp/fake.py',
             }],
         }
-        with patch('codesnake.shutil.which', return_value='/usr/bin/bandit'):
-            with patch('codesnake._subprocess.run') as run:
+        with patch('codesnake.checker.shutil.which', return_value='/usr/bin/bandit'):
+            with patch('codesnake.checker._subprocess.run') as run:
                 run.return_value.stdout = json.dumps(fake)
                 run.return_value.returncode = 1
                 found = collect_bandit_issues(['/tmp/fake.py'])
@@ -1179,7 +1179,7 @@ class TestCrossFileAndBaseline(unittest.TestCase):
             path = Path(tmp) / 'staged.py'
             path.write_text('eval(input())\n', encoding='utf-8')
             buf = StringIO()
-            with patch('codesnake.git_staged_python_files', return_value=([str(path)], None)):
+            with patch('codesnake.checker.git_staged_python_files', return_value=([str(path)], None)):
                 rc = run_check(
                     [],
                     config=CheckerConfig(),
@@ -1197,7 +1197,7 @@ class TestCrossFileAndBaseline(unittest.TestCase):
     def test_staged_no_files_exits_zero(self):
         from unittest.mock import patch
 
-        with patch('codesnake.git_staged_python_files', return_value=([], None)):
+        with patch('codesnake.checker.git_staged_python_files', return_value=([], None)):
             rc = run_check(
                 [],
                 config=CheckerConfig(),
@@ -1510,7 +1510,7 @@ except KeyError:
 
     def test_io_issue_text_has_no_bogus_location(self):
         from codesnake import format_issue
-        from codesnake import _io_issue
+        from codesnake.checker import _io_issue
         rendered = format_issue(_io_issue('missing.py', 'File not found'), '', use_color=False)
         self.assertNotIn('Line 0', rendered)
         self.assertIn('missing.py', rendered)
@@ -1603,7 +1603,7 @@ class TestStagedAndLauncherRegressions(unittest.TestCase):
             old_cwd = os.getcwd()
             os.chdir(root / 'pkg')
             try:
-                with patch('codesnake._subprocess.run', side_effect=fake_run):
+                with patch('codesnake.checker._subprocess.run', side_effect=fake_run):
                     files, error = git_staged_python_files()
             finally:
                 os.chdir(old_cwd)
@@ -1619,7 +1619,7 @@ class TestStagedAndLauncherRegressions(unittest.TestCase):
             stdout = ''
             stderr = 'fatal: not a git repository\n'
 
-        with patch('codesnake._subprocess.run', return_value=Failed()):
+        with patch('codesnake.checker._subprocess.run', return_value=Failed()):
             files, error = git_staged_python_files()
         self.assertEqual(files, [])
         self.assertIn('not a git repository', error)
@@ -1926,6 +1926,82 @@ def f(p):
     return fh.read()
 """
         self.assertEqual(len(self._res(code)), 1)
+
+
+class TestPackageAndCli(unittest.TestCase):
+    """The package layout, version single-sourcing, and unified CLI."""
+
+    def test_version_is_single_sourced(self):
+        import codesnake
+        from codesnake import banner
+        from codesnake._version import __version__
+        self.assertEqual(codesnake.__version__, __version__)
+        self.assertEqual(banner.VERSION, __version__)
+
+    def test_public_api_exports(self):
+        import codesnake
+        for name in ('SemanticChecker', 'CheckerConfig', 'ConfigError', 'check_file',
+                     'run_check', 'format_sarif_report', 'main', '__version__'):
+            self.assertTrue(hasattr(codesnake, name), name)
+
+    def test_check_file_accepts_preread_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'a.py'
+            path.write_text('x = 1\n', encoding='utf-8')
+            # The on-disk file is clean; the supplied source is not.
+            issues = check_file(str(path), source='eval(input())\n')
+            self.assertEqual([i.code for i in issues], ['SEC001'])
+            self.assertEqual(check_file(str(path)), [])
+
+    def test_cli_shorthand_equals_check(self):
+        from codesnake.cli import normalize_argv
+        self.assertEqual(normalize_argv(['a.py', '--format', 'json']),
+                         ['check', 'a.py', '--format', 'json'])
+        self.assertEqual(normalize_argv(['--staged']), ['check', '--staged'])
+        self.assertEqual(normalize_argv(['check', 'a.py']), ['check', 'a.py'])
+        self.assertEqual(normalize_argv(['--version']), ['--version'])
+        self.assertEqual(normalize_argv([]), [])
+
+    def test_cli_main_runs_check_and_returns_exit_code(self):
+        from unittest.mock import patch
+        from codesnake.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / 'bad.py'
+            bad.write_text('eval(input())\n', encoding='utf-8')
+            good = Path(tmp) / 'good.py'
+            good.write_text('x = 1\n', encoding='utf-8')
+            with patch('sys.stdout', StringIO()):
+                self.assertEqual(main([str(bad), '--format', 'json']), 1)
+                self.assertEqual(main(['check', str(good), '--format', 'json']), 0)
+
+    def test_cli_check_without_files_is_usage_error(self):
+        from unittest.mock import patch
+        from codesnake.cli import main
+        with patch('sys.stderr', StringIO()) as err:
+            self.assertEqual(main(['check']), 2)
+        self.assertIn('provide files', err.getvalue())
+
+    def test_cli_config_writes_defaults(self):
+        from unittest.mock import patch
+        from codesnake.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'c.json'
+            with patch('sys.stdout', StringIO()):
+                self.assertEqual(main(['config', '-o', str(out)]), 0)
+            self.assertEqual(json.loads(out.read_text()), json.loads(json.dumps(
+                __import__('dataclasses').asdict(CheckerConfig()))))
+
+    def test_python_dash_m_entry_point(self):
+        import os
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).parent.parent / 'src'))
+        completed = subprocess.run(
+            [sys.executable, '-m', 'codesnake', '--version'],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        from codesnake import __version__
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(__version__, completed.stdout)
 
 
 def run_tests():

@@ -37,7 +37,7 @@ Usage: $0 [OPTIONS] [files...]
 Options:
     -h, --help              Show this help message
     -v, --version           Show CodeSnake version
-    -e, --enhanced          Use enhanced version (codesnake_enhanced.py)
+    -e, --enhanced          (deprecated, no-op: all features live in the main CLI)
     -c, --config FILE       Use configuration file
     -f, --format FORMAT     Output format (text|json|github|sarif)
     -s, --severity LEVEL    Minimum severity (error|warning|info)
@@ -51,7 +51,7 @@ Any other argument (files, directories, --bandit, --staged, --baseline FILE,
 
 Examples:
     $0 mycode.py                           # Check a file
-    $0 -e --config .codesnake.json *.py    # Enhanced mode with config
+    $0 --config .codesnake.json *.py       # Check with a config file
     $0 --test                               # Run tests
     $0 --create-venv                        # Setup virtual environment
 
@@ -111,7 +111,6 @@ activate_venv() {
 }
 
 # Parse arguments
-USE_ENHANCED=false
 USE_VENV=true
 MODE="check"
 PASSTHRU=()   # flags and files forwarded verbatim to CodeSnake
@@ -135,7 +134,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -e|--enhanced)
-            USE_ENHANCED=true
+            # Deprecated: the enhanced checker was merged into the main CLI.
             shift
             ;;
         -c|--config)
@@ -188,6 +187,9 @@ if [ "$USE_VENV" = true ]; then
     activate_venv
 fi
 
+# Make the package importable even without an editable install.
+export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
+
 case "$MODE" in
     test)
         if [ -f "${SCRIPT_DIR}/test/test_codesnake.py" ]; then
@@ -197,19 +199,14 @@ case "$MODE" in
         exit 1
         ;;
     banner)
-        exec "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py" --banner
+        exec "$PYTHON" -m codesnake --banner
         ;;
     version)
-        exec "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py" --version
+        exec "$PYTHON" -m codesnake --version
         ;;
     *)
-        if [ "$USE_ENHANCED" = true ]; then
-            ENTRY="${SCRIPT_DIR}/src/codesnake_enhanced.py"
-        else
-            ENTRY="${SCRIPT_DIR}/src/codesnake.py"
-        fi
         # Arguments are passed as an array: paths with spaces or shell
         # metacharacters are never re-parsed by the shell.
-        exec "$PYTHON" "$ENTRY" "${PASSTHRU[@]}"
+        exec "$PYTHON" -m codesnake check "${PASSTHRU[@]}"
         ;;
 esac

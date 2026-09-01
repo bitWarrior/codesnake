@@ -23,20 +23,20 @@ Or run `./setup.sh`, which creates the venv and installs from `pyproject.toml`.
 After an editable install, `codesnake` is on `PATH`. You can also run:
 
 ```bash
-python src/codesnake.py file.py
-python src/codesnake_cli.py check file.py
-./codesnake.sh file.py
+python -m codesnake check file.py            # after install
+PYTHONPATH=src python -m codesnake file.py   # straight from a checkout
+./codesnake.sh file.py                        # creates/activates codesnake-venv/
 ```
 
 ## Usage
 
 ```bash
 # Files or directories (walks *.py, skips venvs, caches, and .gitignore)
-codesnake check src/codesnake.py test/example_bad_code.py
+codesnake check src/codesnake/checker.py test/example_bad_code.py
 codesnake check src/
 
 # Same thing without the subcommand
-python src/codesnake.py src/
+codesnake src/
 
 # JSON for CI
 codesnake check --format json --no-color src/
@@ -91,7 +91,7 @@ codesnake config -o .codesnake.json
 |---|---|
 | `0` | No error-severity issues (or `--staged` with no staged Python files) |
 | `1` | At least one error, I/O failure, syntax error, bad config/baseline, or git failure |
-| `2` | CLI usage error |
+| `2` | CLI usage error (unknown flag, or `check` with neither files nor `--staged`) |
 
 Missing files, empty directories, and decode failures are **IO001**. Syntax errors are **SYN001**. Those always fail the run; they are never printed as “no issues found.”
 
@@ -178,7 +178,7 @@ If `.codesnake.json` exists in the current directory, it is loaded automatically
 }
 ```
 
-`check_*` turns whole categories off (`check_reliability` covers REL002 and ASY001). `report_*` filters by severity. `use_bandit` merges Bandit when it is installed. A stricter sample lives in `codesnake.json`.
+`check_*` turns whole categories off (`check_reliability` covers REL002 and ASY001). `report_*` filters by severity. `use_bandit` merges Bandit when it is installed. A stricter sample lives in `examples/strict.codesnake.json`.
 
 ## Library API
 
@@ -186,7 +186,8 @@ If `.codesnake.json` exists in the current directory, it is loaded automatically
 from codesnake import CheckerConfig, SemanticChecker, check_file, run_check
 
 issues = SemanticChecker(source, filename="app.py").analyze()
-issues = check_file("app.py")  # I/O failures become IO001
+issues = check_file("app.py")                  # I/O failures become IO001
+issues = check_file("app.py", source=text)     # analyze already-read text
 
 config = CheckerConfig(max_complexity=8, check_style=False)
 rc = run_check(
@@ -206,34 +207,43 @@ Each `Issue` includes `line`, `col`, `end_line`, `end_col`, `suggestion`, and `s
 ## Tests
 
 ```bash
-python test/test_codesnake.py
-codesnake test
+python -m unittest discover -s test -p 'test_*.py'
+python test/test_codesnake.py          # same suite, with a summary
 ./codesnake-launcher.sh --no-venv --test
 ```
+
+CI (`.github/workflows/ci.yml`) runs the suite on Python 3.10–3.13 and then runs `codesnake check --format github src/` on the checker's own source.
 
 `test/example_bad_code.py` is a fixture with intentional issues:
 
 ```bash
-python src/codesnake.py test/example_bad_code.py
+codesnake check test/example_bad_code.py
 ```
 
 ## Project layout
 
 ```
 codesnake/
-├── pyproject.toml            # packaging and optional extras
+├── pyproject.toml            # packaging, extras, console script
+├── LICENSE                   # MIT
 ├── .codesnake.json           # default checker config
 ├── setup.sh                  # venv + editable install
 ├── codesnake.sh              # simple launcher
-├── codesnake-launcher.sh     # flags, --test, -e enhanced
-├── src/
-│   ├── codesnake.py          # checker + argparse CLI
-│   ├── codesnake_cli.py      # check / test / config / version
-│   ├── codesnake_enhanced.py # compatibility entry point
-│   └── codesnake_banner.py
-├── test/
-└── docs/                     # extra guides (banner, scripts, structure)
+├── codesnake-launcher.sh     # flags, --test, --create-venv, --no-venv
+├── src/codesnake/
+│   ├── __init__.py           # public API, __version__
+│   ├── __main__.py           # python -m codesnake
+│   ├── _version.py           # the one place the version lives
+│   ├── checker.py            # SemanticChecker, config, discovery, formats, run_check
+│   ├── cli.py                # check / config / version
+│   └── banner.py
+├── test/                     # unittest suite + fixture
+├── examples/                 # strict.codesnake.json
+├── docs/                     # extra guides
+└── .github/workflows/ci.yml
 ```
+
+Releasing: bump `__version__` in `src/codesnake/_version.py`; `pyproject.toml` reads it dynamically.
 
 ## License
 

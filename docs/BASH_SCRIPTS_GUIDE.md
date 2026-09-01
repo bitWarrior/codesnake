@@ -83,7 +83,7 @@ Complete guide to the CodeSnake launcher scripts and virtual environment managem
 ./codesnake-launcher.sh mycode.py
 
 # Check with enhanced mode
-./codesnake-launcher.sh -e mycode.py
+./codesnake-launcher.sh mycode.py
 
 # Use custom config
 ./codesnake-launcher.sh -c strict.json mycode.py
@@ -98,7 +98,7 @@ Complete guide to the CodeSnake launcher scripts and virtual environment managem
 ./codesnake-launcher.sh -s error mycode.py
 
 # Enhanced mode with all options
-./codesnake-launcher.sh -e -c .codesnake.json -f json -s warning src/*.py
+./codesnake-launcher.sh -c .codesnake.json -f json -s warning src/*.py
 ```
 
 **Utility Commands:**
@@ -153,7 +153,7 @@ your-project/
 source codesnake-venv/bin/activate
 
 # Now you can use CodeSnake directly
-python codesnake.py mycode.py
+codesnake check mycode.py
 
 # Deactivate when done
 deactivate
@@ -202,7 +202,7 @@ pip install --upgrade pip
 ./codesnake.sh src/**/*.py
 
 # Enhanced mode with config
-./codesnake-launcher.sh -e -c .codesnake.json src/
+./codesnake-launcher.sh -c .codesnake.json src/
 ```
 
 ### CI/CD Integration
@@ -241,7 +241,7 @@ pip install --upgrade pip
 | Quick daily check | `codesnake.sh` | `./codesnake.sh file.py` |
 | Need config file | `codesnake-launcher.sh` | `./codesnake-launcher.sh -c config.json file.py` |
 | CI/CD pipeline | `codesnake-launcher.sh` | `./codesnake-launcher.sh -f json src/` |
-| Advanced options | `codesnake-launcher.sh` | `./codesnake-launcher.sh -e -s error src/` |
+| Advanced options | `codesnake-launcher.sh` | `./codesnake-launcher.sh -s error src/` |
 | Running tests | `codesnake-launcher.sh` | `./codesnake-launcher.sh --test` |
 
 ---
@@ -329,23 +329,18 @@ test:
 Recommended project structure:
 
 ```
-your-project/
-├── codesnake-venv/              # Virtual environment (auto-created)
-├── test/                        # Test directory
-│   ├── __init__.py              # Package marker
-│   ├── README.md                # Test documentation
+codesnake/
+├── codesnake-venv/              # Virtual environment (auto-created by the scripts)
+├── src/codesnake/               # The package (checker.py, cli.py, banner.py, ...)
+├── test/
 │   ├── test_codesnake.py        # Test suite
-│   └── example_bad_code.py      # Example with issues
-├── codesnake.py                 # Main checker
-├── codesnake_enhanced.py        # Enhanced version
-├── codesnake_banner.py          # Banner module
+│   └── example_bad_code.py      # Fixture with intentional issues
+├── examples/strict.codesnake.json
 ├── codesnake.sh                 # Simple launcher
-├── codesnake-launcher.sh        # Enhanced launcher
-├── setup.sh                     # Setup script
-├── .codesnake.json              # Configuration
-├── README.md                    # Documentation
-├── QUICKSTART.md                # Quick guide
-└── BASH_SCRIPTS_GUIDE.md        # This file
+├── codesnake-launcher.sh        # Launcher with --test / --create-venv / --no-venv
+├── setup.sh                     # One-time setup
+├── .codesnake.json              # Default configuration
+└── README.md
 ```
 
 ---

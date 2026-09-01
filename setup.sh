@@ -103,13 +103,13 @@ echo -e "${GREEN}✓ Scripts are executable${NC}\n"
 # Create default config if it doesn't exist
 if [ ! -f "${SCRIPT_DIR}/.codesnake.json" ]; then
     echo -e "${YELLOW}Creating default configuration file...${NC}"
-    python3 "${SCRIPT_DIR}/src/codesnake_cli.py" config -o "${SCRIPT_DIR}/.codesnake.json" > /dev/null
+    PYTHONPATH="${SCRIPT_DIR}/src" python3 -m codesnake config -o "${SCRIPT_DIR}/.codesnake.json" > /dev/null
     echo -e "${GREEN}✓ Created .codesnake.json${NC}\n"
 fi
 
 # Test installation
 echo -e "${BLUE}Testing CodeSnake installation...${NC}"
-if python3 "${SCRIPT_DIR}/src/codesnake.py" --help &> /dev/null; then
+if python3 -m codesnake --help &> /dev/null; then
     echo -e "${GREEN}✓ CodeSnake is working!${NC}\n"
 else
     echo -e "${RED}Warning: Could not verify CodeSnake installation${NC}\n"
@@ -127,8 +127,8 @@ echo
 echo "  1. Check a file:"
 echo -e "     ${YELLOW}./codesnake.sh test/example_bad_code.py${NC}"
 echo
-echo "  2. Check with enhanced mode:"
-echo -e "     ${YELLOW}./codesnake-launcher.sh -e your_code.py${NC}"
+echo "  2. Check with JSON output:"
+echo -e "     ${YELLOW}./codesnake-launcher.sh --format json your_code.py${NC}"
 echo
 echo "  3. Run tests:"
 echo -e "     ${YELLOW}./codesnake-launcher.sh --test${NC}"

@@ -18,13 +18,13 @@ CodeSnake strikes at code problems before they bite! A comprehensive static anal
 
 ```bash
 # Basic usage
-python codesnake.py your_code.py
+codesnake check your_code.py
 
 # With configuration
-python codesnake_enhanced.py --config .codesnake.json your_code.py
+codesnake check --config .codesnake.json your_code.py
 
 # Try the demo
-python codesnake.py test/example_bad_code.py
+codesnake check test/example_bad_code.py
 ```
 
 ## ✨ Features
@@ -65,7 +65,6 @@ python codesnake.py test/example_bad_code.py
 
 ```bash
 # No dependencies required for basic functionality
-chmod +x codesnake.py
 
 # For enhanced features (optional):
 pip install pylint flake8 mypy bandit
@@ -77,26 +76,26 @@ pip install pylint flake8 mypy bandit
 
 ```bash
 # Check a single file
-python codesnake.py your_code.py
+codesnake check your_code.py
 
 # Check multiple files
-python codesnake.py file1.py file2.py file3.py
+codesnake check file1.py file2.py file3.py
 ```
 
 ### Enhanced Mode
 
 ```bash
 # With custom configuration
-python codesnake_enhanced.py --config .codesnake.json src/*.py
+codesnake check --config .codesnake.json src/*.py
 
 # JSON output
-python codesnake_enhanced.py --format json src/*.py
+codesnake check --format json src/*.py
 
 # Only show errors
-python codesnake_enhanced.py --severity error src/*.py
+codesnake check --severity error src/*.py
 
 # GitHub Actions format
-python codesnake_enhanced.py --format github src/*.py
+codesnake check --format github src/*.py
 ```
 
 ## 📖 Example Output
@@ -230,7 +229,7 @@ FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$')
 
 if [ -n "$FILES" ]; then
     echo "🐍 CodeSnake is checking your code..."
-    python codesnake.py $FILES
+    codesnake check $FILES
     
     if [ $? -ne 0 ]; then
         echo "❌ Code quality checks failed!"
@@ -257,7 +256,7 @@ jobs:
         with:
           python-version: '3.9'
       - name: Run CodeSnake
-        run: python codesnake.py **/*.py
+        run: codesnake check **/*.py
 ```
 
 ### VS Code Task
@@ -272,7 +271,7 @@ Create `.vscode/tasks.json`:
             "label": "CodeSnake Check",
             "type": "shell",
             "command": "python",
-            "args": ["codesnake.py", "${file}"],
+            "args": ["-m", "codesnake", "check", "${file}"],
             "problemMatcher": []
         }
     ]
@@ -318,22 +317,22 @@ python test/test_codesnake.py
 
 ### Quick Check Before Commit
 ```bash
-git diff --cached --name-only | grep '\.py$' | xargs python codesnake.py
+git diff --cached --name-only | grep '\.py$' | xargs codesnake check
 ```
 
 ### Check Entire Project
 ```bash
-find . -name "*.py" -not -path "./venv/*" | xargs python codesnake.py
+find . -name "*.py" -not -path "./venv/*" | xargs codesnake check
 ```
 
 ### Generate JSON Report
 ```bash
-python codesnake_enhanced.py --format json src/ > report.json
+codesnake check --format json src/ > report.json
 ```
 
 ### Focus on Critical Issues
 ```bash
-python codesnake_enhanced.py --severity error src/
+codesnake check --severity error src/
 ```
 
 ## 📚 Resources

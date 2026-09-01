@@ -2,6 +2,8 @@
 CodeSnake ASCII Art and Branding
 """
 
+from ._version import __version__
+
 def print_snake_banner():
     """Print the colorful CodeSnake ASCII banner."""
     # ANSI Color Codes
@@ -57,7 +59,7 @@ SNAKE_SMALL = r"""
 
 SNAKE_TINY = "🐍 CodeSnake"
 
-VERSION = "1.0.0"
+VERSION = __version__
 TAGLINE = "Semantic Code Checker for Python 3"
 
 def print_banner():

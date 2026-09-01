@@ -8,7 +8,6 @@ A comprehensive tool to detect coding issues, anti-patterns, and potential bugs.
 
 from __future__ import annotations
 
-import argparse
 import ast
 import builtins
 import json
@@ -20,6 +19,9 @@ import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Pattern, Sequence, Set, TextIO, Tuple
+
+from ._version import __version__
+from .banner import print_snake_banner
 
 
 SEVERITY_RANK = {'error': 3, 'warning': 2, 'info': 1}
@@ -334,6 +336,18 @@ def ignored_codes_on_line(line: str) -> Optional[Set[str]]:
     return {part.strip().upper() for part in spec.replace(',', ' ').split() if part.strip()}
 
 
+def issue_ignored_by_pragma(code: str, line: int, source_lines: Sequence[str]) -> bool:
+    """True if a ``# noqa`` / ``# codesnake: ignore`` pragma on ``line`` covers ``code``."""
+    if line <= 0 or line > len(source_lines):
+        return False
+    codes = ignored_codes_on_line(source_lines[line - 1])
+    if codes is None:
+        return False
+    if not codes:
+        return True
+    return code.upper() in codes
+
+
 def iter_python_files(root: Path) -> Iterable[Path]:
     """Yield .py files under root, skipping venvs, caches, and .gitignore matches."""
     try:
@@ -501,13 +515,9 @@ class SemanticChecker(ast.NodeVisitor):
         self.issues: List[Issue] = []
         self.source_lines = source_code.split('\n')
 
-        self.current_function = None
-        self.current_class = None
-        self.imported_names: Set[str] = set()
-        self.defined_names: Set[str] = set()
-        self.used_names: Set[str] = set()
-        self.function_complexity: Dict[str, int] = {}
         self.aliases: Dict[str, str] = {}
+        # Cyclomatic complexity per function name (nested scopes not charged).
+        self.function_complexity: Dict[str, int] = {}
         self.scopes: List[_Scope] = []
         self._in_type_checking = False
         self._with_expr_ids: Set[int] = set()
@@ -527,9 +537,7 @@ class SemanticChecker(ast.NodeVisitor):
         node: ast.AST,
         code: str,
     ):
-        """Add an issue to the issues list if the category is enabled."""
-        if not self.config.allows_category(category):
-            return
+        """Add an issue at ``node``'s location if its category is enabled."""
         self._record_issue(
             severity,
             category,
@@ -834,14 +842,7 @@ class SemanticChecker(ast.NodeVisitor):
         return any(part in _TEST_FILE_DIRS for part in path.parts[:-1])
 
     def _is_ignored(self, issue: Issue) -> bool:
-        if issue.line <= 0 or issue.line > len(self.source_lines):
-            return False
-        codes = ignored_codes_on_line(self.source_lines[issue.line - 1])
-        if codes is None:
-            return False
-        if not codes:
-            return True
-        return issue.code.upper() in codes
+        return issue_ignored_by_pragma(issue.code, issue.line, self.source_lines)
 
     def _is_type_checking_test(self, test: ast.AST) -> bool:
         resolved = self._resolve_name(test)
@@ -1228,11 +1229,6 @@ class SemanticChecker(ast.NodeVisitor):
 
     def _check_function(self, node: ast.AST, is_lambda: bool = False) -> None:
         name = getattr(node, 'name', '<lambda>')
-        old_function = self.current_function
-        self.current_function = name
-        if not is_lambda:
-            self.defined_names.add(name)
-
         args = node.args  # type: ignore[attr-defined]
         total_args = self._count_params(args)
         if total_args > self.config.max_function_params:
@@ -1285,12 +1281,9 @@ class SemanticChecker(ast.NodeVisitor):
 
         # The body runs later; defer it so names bound after this def are visible.
         self._deferred.append((node, list(self.scopes), self._in_type_checking))
-        self.current_function = old_function
 
     def _visit_function_body(self, node: ast.AST) -> None:
         name = getattr(node, 'name', '<lambda>')
-        old_function = self.current_function
-        self.current_function = name
         args = node.args  # type: ignore[attr-defined]
 
         scope = self._push_scope('function', name)
@@ -1322,7 +1315,6 @@ class SemanticChecker(ast.NodeVisitor):
         # popped, so their uses of our locals count and we report accurately.
         self._run_deferred(queued)
         self._pop_scope()
-        self.current_function = old_function
 
     def _run_deferred(self, start: int) -> None:
         """Analyze function bodies deferred since ``start`` (they may defer more)."""
@@ -1339,9 +1331,6 @@ class SemanticChecker(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef):
         """Check class definitions."""
         self._bind(node.name, node, 'class')
-        old_class = self.current_class
-        self.current_class = node.name
-        self.defined_names.add(node.name)
         self._push_scope('class', node.name)
 
         methods = [
@@ -1378,7 +1367,6 @@ class SemanticChecker(ast.NodeVisitor):
 
         self.generic_visit(node)
         self._pop_scope()
-        self.current_class = old_class
 
     # Exception Handling Checks
 
@@ -1477,7 +1465,6 @@ class SemanticChecker(ast.NodeVisitor):
         """Check import statements."""
         for alias in node.names:
             bound = alias.asname if alias.asname else alias.name.split('.')[0]
-            self.imported_names.add(bound)
             self._bind(bound, node, 'import')
             if self._in_type_checking:
                 scope = self._current_scope()
@@ -1502,7 +1489,6 @@ class SemanticChecker(ast.NodeVisitor):
                 )
             else:
                 bound = alias.asname if alias.asname else alias.name
-                self.imported_names.add(bound)
                 self._bind(bound, node, 'import')
                 if self._in_type_checking:
                     scope = self._current_scope()
@@ -1537,10 +1523,8 @@ class SemanticChecker(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name):
         """Track variable usage."""
         if isinstance(node.ctx, ast.Load):
-            self.used_names.add(node.id)
             self._mark_used(node.id)
         elif isinstance(node.ctx, ast.Store):
-            self.defined_names.add(node.id)
             scope = self._current_scope()
             if scope is not None:
                 # Any rebinding invalidates a previously recorded constant.
@@ -1630,12 +1614,6 @@ class SemanticChecker(ast.NodeVisitor):
     def visit_GeneratorExp(self, node: ast.GeneratorExp):
         self._visit_comprehension(node)
 
-    def visit_JoinedStr(self, node: ast.JoinedStr):
-        self.generic_visit(node)
-
-    def visit_BinOp(self, node: ast.BinOp):
-        self.generic_visit(node)
-
     def _complexity_contrib(self, node: ast.AST) -> int:
         """Contribution of this node and its descendants, skipping nested scopes."""
         if isinstance(node, NESTED_SCOPE_NODES):
@@ -1662,17 +1640,11 @@ class SemanticChecker(ast.NodeVisitor):
             complexity += self._complexity_contrib(child)
         return complexity
 
-    def check_unused_imports(self):
-        """Placeholder: unused-import detection needs per-import line tracking."""
-        unused = self.imported_names - self.used_names
-        for name in unused:
-            if name not in ('__future__', 'typing'):
-                pass
-
     def analyze(self) -> List[Issue]:
         """Perform the complete analysis."""
         self.issues = []
         self.aliases = {}
+        self.function_complexity = {}
         self._deferred = []
         try:
             tree = ast.parse(self.source_code, filename=self.filename)
@@ -1902,8 +1874,12 @@ def check_file(
     filepath: str,
     config: Optional[CheckerConfig] = None,
     known_exports: Optional[Dict[str, Set[str]]] = None,
+    source: Optional[str] = None,
 ) -> List[Issue]:
-    """Check a Python file for semantic issues. I/O failures become IO001 errors."""
+    """Check a Python file for semantic issues. I/O failures become IO001 errors.
+
+    Pass ``source`` to analyze already-read text without touching the disk again.
+    """
     path = Path(filepath)
     if not path.exists():
         return [_io_issue(filepath, f"File '{filepath}' not found")]
@@ -1911,7 +1887,7 @@ def check_file(
         return [_io_issue(filepath, f"'{filepath}' is not a file")]
 
     try:
-        source_code = read_python_source(path)
+        source_code = source if source is not None else read_python_source(path)
     except LookupError as exc:
         return [_io_issue(filepath, f"Unknown encoding in '{filepath}': {exc}")]
     except UnicodeDecodeError as exc:
@@ -2178,42 +2154,6 @@ def _should_use_color(color: Optional[bool], stream: TextIO) -> bool:
     return hasattr(stream, 'isatty') and stream.isatty()
 
 
-def _print_banner() -> None:
-    try:
-        from codesnake_banner import print_snake_banner
-        print_snake_banner()
-    except ImportError:
-        try:
-            from .codesnake_banner import print_snake_banner
-            print_snake_banner()
-        except ImportError:
-            print("🐍 CodeSnake - Semantic Code Checker\n")
-
-
-def _print_version() -> None:
-    try:
-        from codesnake_banner import print_version
-        print_version()
-    except ImportError:
-        try:
-            from .codesnake_banner import print_version
-            print_version()
-        except ImportError:
-            print("CodeSnake v1.0.0")
-
-
-def _tool_version() -> str:
-    try:
-        from codesnake_banner import VERSION
-        return VERSION
-    except ImportError:
-        try:
-            from .codesnake_banner import VERSION
-            return VERSION
-        except ImportError:
-            return '1.0.0'
-
-
 def run_check(
     files: Sequence[str],
     *,
@@ -2255,7 +2195,7 @@ def run_check(
         return 1
 
     if show_banner and output_format == 'text':
-        _print_banner()
+        print_snake_banner()
 
     targets, extra_issues = expand_python_targets(file_list)
 
@@ -2282,7 +2222,12 @@ def run_check(
 
     for filepath in targets:
         source = sources_by_file.get(filepath)
-        issues = check_file(filepath, config=config, known_exports=known_exports)
+        issues = check_file(
+            filepath,
+            config=config,
+            known_exports=known_exports,
+            source=source,
+        )
         issues = filter_issues(issues, config, min_severity=min_severity)
         file_reports.append((filepath, issues, source))
 
@@ -2302,17 +2247,10 @@ def run_check(
                 extra = by_file.get(os.path.abspath(filepath), [])
                 if source:
                     lines = source.split('\n')
-                    kept = []
-                    for issue in extra:
-                        if issue.line <= 0 or issue.line > len(lines):
-                            kept.append(issue)
-                            continue
-                        codes = ignored_codes_on_line(lines[issue.line - 1])
-                        if codes is None:
-                            kept.append(issue)
-                        elif codes and issue.code.upper() not in codes:
-                            kept.append(issue)
-                    extra = kept
+                    extra = [
+                        issue for issue in extra
+                        if not issue_ignored_by_pragma(issue.code, issue.line, lines)
+                    ]
                 extra = filter_issues(extra, config, min_severity=min_severity)
                 if extra:
                     file_reports[index] = (filepath, issues + extra, source)
@@ -2352,7 +2290,7 @@ def run_check(
     elif output_format == 'github':
         out.write(format_github_report(all_displayed))
     elif output_format == 'sarif':
-        out.write(format_sarif_report(all_displayed, _tool_version()))
+        out.write(format_sarif_report(all_displayed, __version__))
     else:
         any_issues = False
         for filepath, issues, source in file_reports:
@@ -2375,78 +2313,3 @@ def run_check(
             )
 
     return 1 if errors else 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog='codesnake',
-        description='CodeSnake - Semantic Code Checker for Python 3',
-    )
-    parser.add_argument('files', nargs='*', help='Python files or directories to check')
-    parser.add_argument('--config', help='Path to .codesnake.json')
-    parser.add_argument(
-        '--format',
-        choices=['text', 'json', 'github', 'sarif'],
-        default='text',
-        help='Output format',
-    )
-    parser.add_argument(
-        '--severity',
-        choices=['error', 'warning', 'info'],
-        help='Minimum severity to report',
-    )
-    parser.add_argument('--no-color', action='store_true', help='Disable ANSI colors')
-    parser.add_argument(
-        '--bandit',
-        action='store_true',
-        help='Merge findings from the bandit security scanner if it is installed',
-    )
-    parser.add_argument(
-        '--staged',
-        action='store_true',
-        help='Check only Python files staged in git',
-    )
-    parser.add_argument('--baseline', help='Ignore issues listed in this baseline JSON file')
-    parser.add_argument(
-        '--update-baseline',
-        metavar='FILE',
-        help='Write current findings to a baseline JSON file',
-    )
-    parser.add_argument('--version', action='store_true', help='Show version and exit')
-    parser.add_argument('--banner', action='store_true', help='Show banner and exit')
-    return parser
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Main entry point."""
-    parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
-
-    if args.banner:
-        _print_banner()
-        return 0
-
-    if args.version:
-        _print_version()
-        return 0
-
-    if not args.files and not args.staged:
-        parser.print_help()
-        return 1
-
-    return run_check(
-        args.files,
-        config_path=args.config,
-        output_format=args.format,
-        min_severity=args.severity,
-        show_banner=(args.format == 'text'),
-        color=False if args.no_color else None,
-        use_bandit=True if args.bandit else None,
-        staged=args.staged,
-        baseline_path=args.baseline,
-        update_baseline=args.update_baseline,
-    )
-
-
-if __name__ == '__main__':
-    sys.exit(main())

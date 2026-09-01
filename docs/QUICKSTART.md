@@ -8,20 +8,19 @@
 
 ```bash
 # Make the script executable
-chmod +x codesnake.py
 
 # Check a single file
-python codesnake.py your_code.py
+codesnake check your_code.py
 
 # Check multiple files
-python codesnake.py file1.py file2.py file3.py
+codesnake check file1.py file2.py file3.py
 ```
 
 ### 2. Try the Example
 
 ```bash
 # Run on the provided example with intentional issues
-python codesnake.py test/example_bad_code.py
+codesnake check test/example_bad_code.py
 ```
 
 Expected output:
@@ -40,19 +39,19 @@ Summary: 4 errors, 8 warnings, 5 info
 
 ```bash
 # Basic usage
-python codesnake_enhanced.py test/example_bad_code.py
+codesnake check test/example_bad_code.py
 
 # With custom configuration
-python codesnake_enhanced.py --config .codesnake.json test/example_bad_code.py
+codesnake check --config .codesnake.json test/example_bad_code.py
 
 # JSON output
-python codesnake_enhanced.py --format json test/example_bad_code.py
+codesnake check --format json test/example_bad_code.py
 
 # Only show errors
-python codesnake_enhanced.py --severity error test/example_bad_code.py
+codesnake check --severity error test/example_bad_code.py
 
 # SARIF format (for security scanners)
-python codesnake_enhanced.py --format sarif test/example_bad_code.py
+codesnake check --format sarif test/example_bad_code.py
 ```
 
 ### 2. Create Your Own Configuration
@@ -84,7 +83,7 @@ FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$')
 
 if [ -n "$FILES" ]; then
     echo "🐍 CodeSnake is checking your code..."
-    python codesnake.py $FILES
+    codesnake check $FILES
     
     if [ $? -ne 0 ]; then
         echo "❌ CodeSnake found issues. Fix them before committing."
@@ -120,7 +119,7 @@ jobs:
       
       - name: Run CodeSnake
         run: |
-          python codesnake.py **/*.py
+          codesnake check **/*.py
 ```
 
 ### 3. VS Code Integration
@@ -136,7 +135,7 @@ Create `.vscode/tasks.json`:
             "type": "shell",
             "command": "python",
             "args": [
-                "codesnake.py",
+                "-m", "codesnake", "check",
                 "${file}"
             ],
             "problemMatcher": [],
@@ -168,11 +167,11 @@ Add keyboard shortcut in `.vscode/keybindings.json`:
 
 snake:
 	@echo "🐍 CodeSnake is checking your code..."
-	@find . -name "*.py" -not -path "./venv/*" | xargs python codesnake.py
+	@find . -name "*.py" -not -path "./venv/*" | xargs codesnake check
 
 check-strict:
 	@echo "🐍 Running strict checks (errors only)..."
-	@python codesnake_enhanced.py --severity error $(shell find . -name "*.py" -not -path "./venv/*")
+	@codesnake check --severity error $(shell find . -name "*.py" -not -path "./venv/*")
 
 test:
 	@python test_codesnake.py
@@ -195,7 +194,7 @@ echo "🔍 Running comprehensive code analysis..."
 
 # CodeSnake
 echo "1/4 🐍 Running CodeSnake..."
-python codesnake.py *.py || true
+codesnake check *.py || true
 
 # Pylint
 echo "2/4 🔧 Running pylint..."
@@ -252,7 +251,7 @@ def main():
     filepath = sys.argv[1]
     
     tools = [
-        ("CodeSnake", f"python codesnake.py {filepath}", "🐍"),
+        ("CodeSnake", f"codesnake check {filepath}", "🐍"),
         ("Pylint", f"pylint {filepath} --exit-zero", "🔧"),
         ("Bandit Security", f"bandit {filepath}", "🔒"),
         ("MyPy Type Check", f"mypy {filepath}", "✅"),
@@ -289,34 +288,34 @@ if __name__ == '__main__':
 
 ```bash
 # Check staged files only
-git diff --cached --name-only --diff-filter=ACM | grep '\.py$' | xargs python codesnake.py
+git diff --cached --name-only --diff-filter=ACM | grep '\.py$' | xargs codesnake check
 ```
 
 ### Workflow 2: Check Entire Project
 
 ```bash
 # Find and check all Python files
-find . -name "*.py" -not -path "./venv/*" -not -path "./.git/*" | xargs python codesnake.py
+find . -name "*.py" -not -path "./venv/*" -not -path "./.git/*" | xargs codesnake check
 ```
 
 ### Workflow 3: Generate Report
 
 ```bash
 # JSON report for further processing
-python codesnake_enhanced.py --format json src/*.py > code_quality_report.json
+codesnake check --format json src/*.py > code_quality_report.json
 
 # GitHub annotations for CI
-python codesnake_enhanced.py --format github src/*.py
+codesnake check --format github src/*.py
 ```
 
 ### Workflow 4: Focus on Critical Issues
 
 ```bash
 # Only errors
-python codesnake_enhanced.py --severity error *.py
+codesnake check --severity error *.py
 
 # Errors and warnings only (no info)
-python codesnake_enhanced.py --severity warning *.py
+codesnake check --severity warning *.py
 ```
 
 ## Customization Examples
@@ -324,7 +323,7 @@ python codesnake_enhanced.py --severity warning *.py
 ### Example 1: Add a Custom Check
 
 ```python
-# In codesnake.py, add this method to SemanticChecker:
+# In src/codesnake/checker.py, add this method to SemanticChecker:
 
 def visit_Global(self, node):
     """Check for global variable usage."""
@@ -392,23 +391,23 @@ Then adjust based on your codebase:
 
 ```bash
 # Week 1: Just security issues
-python codesnake_enhanced.py --severity error
+codesnake check --severity error
 
 # Week 2: Add critical bugs
-python codesnake_enhanced.py --severity error --config strict-security.json
+codesnake check --severity error --config strict-security.json
 
 # Week 4: Full checks
-python codesnake_enhanced.py --config full-checks.json
+codesnake check --config full-checks.json
 ```
 
 ### 3. Team Workflows
 
 ```bash
 # Team lead: Generate baseline
-python codesnake_enhanced.py --format json src/ > baseline.json
+codesnake check --format json src/ > baseline.json
 
 # Developers: Compare against baseline
-diff <(python codesnake_enhanced.py --format json src/) baseline.json
+diff <(codesnake check --format json src/) baseline.json
 ```
 
 ## Troubleshooting
@@ -431,7 +430,7 @@ diff <(python codesnake_enhanced.py --format json src/) baseline.json
 
 ```bash
 # Run CodeSnake + Bandit for comprehensive security
-python codesnake.py your_code.py && bandit -r your_code.py
+codesnake check your_code.py && bandit -r your_code.py
 ```
 
 ### Issue: Slow on Large Codebase
@@ -465,19 +464,19 @@ if __name__ == '__main__':
 
 ```bash
 # Basic Commands
-python codesnake.py file.py              # Check single file
-python codesnake.py *.py                 # Check all files
-python codesnake.py --help               # Show help
+codesnake check file.py              # Check single file
+codesnake check *.py                 # Check all files
+codesnake --help               # Show help
 
 # Enhanced Commands
-python codesnake_enhanced.py file.py --config .codesnake.json  # With config
-python codesnake_enhanced.py file.py --format json             # JSON output
-python codesnake_enhanced.py file.py --severity error          # Errors only
-python codesnake_enhanced.py file.py --no-color                # No colors
+codesnake check file.py --config .codesnake.json  # With config
+codesnake check file.py --format json             # JSON output
+codesnake check file.py --severity error          # Errors only
+codesnake check file.py --no-color                # No colors
 
 # Common Patterns
-find . -name "*.py" | xargs python codesnake.py        # Check project
-git diff --name-only | grep .py | xargs python codesnake.py  # Check changes
+find . -name "*.py" | xargs codesnake check        # Check project
+git diff --name-only | grep .py | xargs codesnake check  # Check changes
 ```
 
 ## Resources

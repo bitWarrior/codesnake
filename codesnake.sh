@@ -33,7 +33,7 @@ VENV_PATH="${SCRIPT_DIR}/${VENV_NAME}"
 # Function to create virtual environment if it doesn't exist
 create_venv() {
     echo -e "${YELLOW}Creating virtual environment: ${VENV_NAME}${NC}"
-    python3 -m venv "${VENV_PATH}"
+    "$PYTHON" -m venv "${VENV_PATH}"
     
     # Activate and upgrade pip
     source "${VENV_PATH}/bin/activate"
@@ -70,20 +70,16 @@ main() {
     # Activate virtual environment
     activate_venv
     
-    # Check if codesnake.py exists
-    if [ ! -f "${SCRIPT_DIR}/src/codesnake.py" ]; then
-        echo -e "${RED}Error: src/codesnake.py not found in ${SCRIPT_DIR}${NC}"
+    # Make the package importable even without an editable install.
+    export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
+
+    if [ ! -f "${SCRIPT_DIR}/src/codesnake/checker.py" ]; then
+        echo -e "${RED}Error: src/codesnake/checker.py not found in ${SCRIPT_DIR}${NC}"
         exit 1
     fi
-    
-    # Run CodeSnake with all passed arguments
-    if [ $# -eq 0 ]; then
-        # No arguments - show help
-        "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py"
-    else
-        # Pass all arguments to CodeSnake
-        "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py" "$@"
-    fi
+
+    # Run CodeSnake with all passed arguments (no arguments shows help)
+    exec "$PYTHON" -m codesnake "$@"
 }
 
 # Run main function with all script arguments

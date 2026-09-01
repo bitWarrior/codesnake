@@ -19,7 +19,6 @@ Complete documentation for CodeSnake - the Python semantic code checker.
 - Common workflows
 - Integration examples (Git, CI/CD, VS Code)
 
-**[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - Cheat Sheet
 - One-page reference card
 - All commands at a glance
 - Common patterns
@@ -49,7 +48,6 @@ Complete documentation for CodeSnake - the Python semantic code checker.
 - Data flow diagrams
 - Contribution guidelines
 
-**[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)** - Update Guide
 - Version migration steps
 - Breaking changes
 - Path updates
@@ -78,10 +76,8 @@ Complete documentation for CodeSnake - the Python semantic code checker.
 → [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)
 
 **Update from a previous version**
-→ [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)
 
 **Find a specific command**
-→ [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
 
 ## 📋 Documentation Format
 
@@ -102,9 +98,7 @@ docs/
 ├── QUICKSTART.md              # Quick start guide
 ├── BASH_SCRIPTS_GUIDE.md      # Script usage guide
 ├── BANNER_GUIDE.md            # Banner customization
-├── QUICK_REFERENCE.md         # One-page reference
 ├── PROJECT_STRUCTURE.md       # Project organization
-└── MIGRATION_GUIDE.md         # Update guide
 ```
 
 ## 🎓 Learning Path
@@ -113,7 +107,6 @@ docs/
 1. Read [QUICKSTART.md](QUICKSTART.md)
 2. Run `./setup.sh`
 3. Try the examples
-4. Check [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
 
 ### Intermediate Path
 1. Read [README.md](README.md)
@@ -132,7 +125,6 @@ docs/
 ### Search Tips
 
 **Looking for a specific command?**
-→ Use CTRL+F on [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
 
 **Need integration help?**
 → Search for your tool in [QUICKSTART.md](QUICKSTART.md)
@@ -182,7 +174,6 @@ When updating documentation:
 | [README.md](README.md) | Complete reference |
 | [QUICKSTART.md](QUICKSTART.md) | New users |
 | [BASH_SCRIPTS_GUIDE.md](BASH_SCRIPTS_GUIDE.md) | Script users |
-| [QUICK_REFERENCE.md](QUICK_REFERENCE.md) | Daily reference |
 | [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) | Contributors |
 
 ---
