@@ -74,7 +74,7 @@ codesnake config -o .codesnake.json
 | `--baseline FILE` | Hide issues whose fingerprint is already in the baseline |
 | `--update-baseline FILE` | Write the current finding set as a baseline |
 
-`--staged` needs no file arguments. With no staged `.py` files it exits **0**. `--baseline` fingerprints are `filename|code|message`, so line-only edits do not re-fail CI. A missing baseline file fails closed (exit 1).
+`--staged` needs no file arguments and works from any directory inside the repository (paths from git are resolved against the repo root). With no staged `.py` files it exits **0**. `--baseline` fingerprints are `filename|code|message`, so line-only edits do not re-fail CI. A missing baseline file fails closed (exit 1).
 
 ### Output formats
 
@@ -101,15 +101,15 @@ Missing files, empty directories, and decode failures are **IO001**. Syntax erro
 |---|---|---|
 | **SEC001** | info / error | `eval()` / `exec()` — **info** on a constant, **error** on untrusted input |
 | **SEC002** | warning | `pickle.loads` / `pickle.load` |
-| **SEC003** | warning / error | `subprocess` with `shell=True` (**error** if the command is untrusted) |
-| **SEC004** | warning | `subprocess` command built from untrusted input |
+| **SEC003** | warning / error | `subprocess` with `shell=True`, or `os.system` / `os.popen` / `subprocess.getoutput` (**error** if the command is untrusted) |
+| **SEC004** | warning | `subprocess` command (`run`, `call`, `Popen`, `check_call`, `check_output`) built from untrusted input |
 | **BUG001** | error | Mutable default arguments (`[]`, `{}`, `set()`, `list()`, kw-only, `lambda`, `async def`) |
 | **BUG002** | warning | Duplicate key in a dict literal |
 | **EXC001** | warning | Bare `except:` |
 | **EXC002** | info | `except Exception` |
 | **EXC003** | warning | Empty `except` body (`pass`) |
 | **EXC004** | warning | `raise Exception()` with no message |
-| **EXC005** | warning | `raise NewError(...)` inside `except` without `from` |
+| **EXC005** | warning | `raise NewError(...)` inside `except` / `except*` without `from` |
 | **COMP001** | warning | Too many parameters |
 | **COMP002** | warning | Cyclomatic complexity too high (nested functions are not charged to the parent) |
 | **COMP003** | warning | Function longer than the configured maximum |
@@ -118,7 +118,7 @@ Missing files, empty directories, and decode failures are **IO001**. Syntax erro
 | **PERF001** | info | `for i in range(len(...))` |
 | **STYLE001** | info | `is True` / `is False` |
 | **IMP001** | warning | `from module import *` |
-| **IMP002** | warning | Imported name is never used |
+| **IMP002** | warning | Imported name is never used (module level or inside a function) |
 | **IMP003** | error | Relative import of a name the sibling module does not define |
 | **VAR001** | warning | Unused local or nested function |
 | **VAR002** | warning | Unused argument (`self` / `cls` and `_`-prefixed names are skipped) |
@@ -130,7 +130,9 @@ Missing files, empty directories, and decode failures are **IO001**. Syntax erro
 | **IO001** | error | File missing, not a file, unreadable, or empty directory |
 | **B###** | varies | Bandit test ids, only when `--bandit` / `use_bandit` is on (`source: bandit`) |
 
-Call checks resolve imports (`from subprocess import call`, `import pickle as pkl`) instead of matching only the AST shape. `shell=True` is also detected via a local or module constant (`shell = True; run(..., shell=shell)`).
+Call checks resolve imports (`from subprocess import call`, `import pickle as pkl`) instead of matching only the AST shape. `shell=True` is also detected via a local or module constant (`shell = True; run(..., shell=shell)`); reassigning the name invalidates the constant.
+
+Function bodies are analyzed after the enclosing scope is fully bound, so a closure that references a variable assigned *after* the `def` does not produce a false "unused variable" warning.
 
 Untrusted input (taint) is tracked from `input()`, `sys.argv`, `os.environ` / `os.getenv`, and `request.args` / `GET` / `POST`-style attributes, including f-strings, `+`, `.format()`, `.get()`, and subscripts.
 
@@ -198,7 +200,7 @@ rc = run_check(
 )
 ```
 
-Each `Issue` includes `line`, `col`, `end_line`, `end_col`, `suggestion`, and `source` (`codesnake` or `bandit`).
+Each `Issue` includes `line`, `col`, `end_line`, `end_col`, `suggestion`, and `source` (`codesnake` or `bandit`). `col` / `end_col` are **0-based character offsets** (AST byte offsets are converted), and JSON output reports them as-is. The `text`, `github`, and `sarif` formats print **1-based** columns.
 
 ## Tests
 

@@ -58,6 +58,16 @@ SUBPROCESS_SHELL_NAMES = frozenset({
     'subprocess.call',
     'subprocess.run',
     'subprocess.Popen',
+    'subprocess.check_call',
+    'subprocess.check_output',
+})
+
+# These always run their argument through a shell.
+ALWAYS_SHELL_NAMES = frozenset({
+    'os.system',
+    'os.popen',
+    'subprocess.getoutput',
+    'subprocess.getstatusoutput',
 })
 
 MUTABLE_CTOR_NAMES = frozenset({
@@ -118,6 +128,9 @@ ISSUE_SUGGESTIONS = {
 }
 
 NESTED_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+_TRY_NODES: Tuple[type, ...] = tuple(
+    node_type for node_type in (ast.Try, getattr(ast, 'TryStar', None)) if node_type is not None
+)
 
 SKIP_UNUSED_NAMES = frozenset({'self', 'cls', 'mcs', 'mcls'})
 _BUILTIN_NAMES = frozenset(name for name in dir(builtins) if not name.startswith('_'))
@@ -382,12 +395,34 @@ class CheckerConfig:
         if not isinstance(data, dict):
             raise ConfigError(f"Config file '{path}' must contain a JSON object")
 
-        known = {item.name for item in fields(cls)}
-        kwargs = {key: value for key, value in data.items() if key in known}
-        try:
-            return cls(**kwargs)
-        except TypeError as exc:
-            raise ConfigError(f"Invalid config values in '{path}': {exc}") from exc
+        known = {item.name: item for item in fields(cls)}
+        unknown = sorted(key for key in data if key not in known)
+        if unknown:
+            print(
+                f"Warning: unknown config key(s) in '{path}': {', '.join(unknown)}",
+                file=sys.stderr,
+            )
+
+        kwargs: Dict[str, Any] = {}
+        problems: List[str] = []
+        for key, value in data.items():
+            field = known.get(key)
+            if field is None:
+                continue
+            expected = type(field.default)
+            if expected is bool:
+                valid = isinstance(value, bool)
+            else:
+                valid = isinstance(value, int) and not isinstance(value, bool)
+            if not valid:
+                problems.append(
+                    f"'{key}' must be {expected.__name__}, got {type(value).__name__}"
+                )
+                continue
+            kwargs[key] = value
+        if problems:
+            raise ConfigError(f"Invalid config values in '{path}': " + '; '.join(problems))
+        return cls(**kwargs)
 
     def to_file(self, path: str) -> None:
         output = Path(path)
@@ -445,6 +480,9 @@ class SemanticChecker(ast.NodeVisitor):
         self.scopes: List[_Scope] = []
         self._in_type_checking = False
         self._with_expr_ids: Set[int] = set()
+        # Function bodies are analyzed after the enclosing scope is fully bound,
+        # so closures may reference names assigned later in that scope.
+        self._deferred: List[Tuple[ast.AST, List[_Scope], bool]] = []
         self.known_exports = known_exports or {}
 
     def add_issue(
@@ -484,6 +522,9 @@ class SemanticChecker(ast.NodeVisitor):
     ) -> None:
         if not self.config.allows_category(category):
             return
+        end_line = end_line or line
+        col = self._char_col(line, col)
+        end_col = self._char_col(end_line, end_col) if end_col else col
         self.issues.append(Issue(
             severity=severity,
             category=category,
@@ -493,10 +534,19 @@ class SemanticChecker(ast.NodeVisitor):
             code=code,
             filename=self.filename,
             source=source,
-            end_line=end_line or line,
-            end_col=end_col or col,
+            end_line=end_line,
+            end_col=end_col,
             suggestion=suggestion or ISSUE_SUGGESTIONS.get(code, ''),
         ))
+
+    def _char_col(self, line: int, col: int) -> int:
+        """Convert an AST UTF-8 byte offset into a 0-based character offset."""
+        if col <= 0 or line <= 0 or line > len(self.source_lines):
+            return max(col, 0)
+        text = self.source_lines[line - 1]
+        if text.isascii():
+            return col
+        return len(text.encode('utf-8')[:col].decode('utf-8', errors='ignore'))
 
     def _current_scope(self) -> Optional[_Scope]:
         return self.scopes[-1] if self.scopes else None
@@ -691,7 +741,16 @@ class SemanticChecker(ast.NodeVisitor):
                 continue
             if name in SKIP_UNUSED_NAMES or name.startswith('_'):
                 continue
-            if binding.kind == 'arg':
+            if binding.kind == 'import':
+                self._record_issue(
+                    'warning',
+                    'imports',
+                    f"Imported name '{name}' is unused",
+                    binding.line,
+                    binding.col,
+                    'IMP002',
+                )
+            elif binding.kind == 'arg':
                 self._record_issue(
                     'warning',
                     'unused',
@@ -839,9 +898,12 @@ class SemanticChecker(ast.NodeVisitor):
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
                 yield from self._iter_raises(stmt.body)
                 yield from self._iter_raises(getattr(stmt, 'orelse', []))
-            elif isinstance(stmt, ast.Try):
+            elif isinstance(stmt, _TRY_NODES):
                 yield from self._iter_raises(stmt.body)
                 yield from self._iter_raises(stmt.finalbody)
+            elif isinstance(stmt, ast.Match):
+                for case in stmt.cases:
+                    yield from self._iter_raises(case.body)
 
     def _check_lossy_raises(self, handler: ast.ExceptHandler) -> None:
         for raise_node in self._iter_raises(handler.body):
@@ -945,6 +1007,26 @@ class SemanticChecker(ast.NodeVisitor):
                     "subprocess command built from untrusted input",
                     node,
                     'SEC004',
+                )
+
+        if resolved in ALWAYS_SHELL_NAMES:
+            cmd = node.args[0] if node.args else None
+            if cmd is not None and self._is_tainted_expr(cmd):
+                self.add_issue(
+                    'error',
+                    'security',
+                    f"{resolved}() with untrusted input is command injection",
+                    node,
+                    'SEC003',
+                )
+            else:
+                self.add_issue(
+                    'warning',
+                    'security',
+                    f"{resolved}() runs its argument through a shell - "
+                    "use subprocess with shell=False and an argument list",
+                    node,
+                    'SEC003',
                 )
 
         if resolved in OPEN_NAMES and id(node) not in self._with_expr_ids:
@@ -1108,6 +1190,26 @@ class SemanticChecker(ast.NodeVisitor):
                         'COMP003',
                     )
 
+        # Decorators, defaults, annotations, and type parameters are evaluated in
+        # the enclosing scope when the def statement runs, so visit them now.
+        for field_name in ('decorator_list', 'type_params'):
+            for child in getattr(node, field_name, None) or []:
+                self.visit(child)
+        returns = getattr(node, 'returns', None)
+        if returns is not None:
+            self.visit(returns)
+        self.visit(args)
+
+        # The body runs later; defer it so names bound after this def are visible.
+        self._deferred.append((node, list(self.scopes), self._in_type_checking))
+        self.current_function = old_function
+
+    def _visit_function_body(self, node: ast.AST) -> None:
+        name = getattr(node, 'name', '<lambda>')
+        old_function = self.current_function
+        self.current_function = name
+        args = node.args  # type: ignore[attr-defined]
+
         self._push_scope('function', name)
         for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
             self._bind(arg.arg, arg, 'arg')
@@ -1116,9 +1218,30 @@ class SemanticChecker(ast.NodeVisitor):
         if args.kwarg is not None:
             self._bind(args.kwarg.arg, args.kwarg, 'arg')
 
-        self.generic_visit(node)
+        body = node.body  # type: ignore[attr-defined]
+        queued = len(self._deferred)
+        if isinstance(body, list):
+            for stmt in body:
+                self.visit(stmt)
+        else:
+            self.visit(body)
+        # Nested functions queued by this body must run before this scope is
+        # popped, so their uses of our locals count and we report accurately.
+        self._run_deferred(queued)
         self._pop_scope()
         self.current_function = old_function
+
+    def _run_deferred(self, start: int) -> None:
+        """Analyze function bodies deferred since ``start`` (they may defer more)."""
+        saved_scopes = self.scopes
+        saved_flag = self._in_type_checking
+        while len(self._deferred) > start:
+            node, scopes, in_type_checking = self._deferred.pop()
+            self.scopes = scopes
+            self._in_type_checking = in_type_checking
+            self._visit_function_body(node)
+        self.scopes = saved_scopes
+        self._in_type_checking = saved_flag
 
     def visit_ClassDef(self, node: ast.ClassDef):
         """Check class definitions."""
@@ -1199,6 +1322,8 @@ class SemanticChecker(ast.NodeVisitor):
 
         self.generic_visit(node)
 
+    visit_TryStar = visit_Try
+
     def visit_Raise(self, node: ast.Raise):
         """Check raise statements."""
         if node.exc and isinstance(node.exc, ast.Call):
@@ -1237,7 +1362,7 @@ class SemanticChecker(ast.NodeVisitor):
         """Check comparison operations."""
         if isinstance(node.ops[0], (ast.Is, ast.IsNot)):
             if node.comparators and isinstance(node.comparators[0], ast.Constant):
-                if node.comparators[0].value in (True, False):
+                if isinstance(node.comparators[0].value, bool):
                     self.add_issue(
                         'info',
                         'style',
@@ -1318,6 +1443,10 @@ class SemanticChecker(ast.NodeVisitor):
             self._mark_used(node.id)
         elif isinstance(node.ctx, ast.Store):
             self.defined_names.add(node.id)
+            scope = self._current_scope()
+            if scope is not None:
+                # Any rebinding invalidates a previously recorded constant.
+                scope.constants.pop(node.id, None)
             self._bind(node.id, node, 'assign')
         elif isinstance(node.ctx, ast.Del):
             self._mark_used(node.id)
@@ -1325,18 +1454,24 @@ class SemanticChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
-        self._record_constant_assign(node.targets, node.value)
         self._record_dunder_all(node)
         self.generic_visit(node)
+        # Record after visiting targets, which clears any stale constant.
+        self._record_constant_assign(node.targets, node.value)
         if self._is_tainted_expr(node.value):
             for target in node.targets:
                 self._mark_tainted_target(target)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
+        self.generic_visit(node)
         if node.value is not None:
             self._record_constant_assign([node.target], node.value)
+            if self._is_tainted_expr(node.value):
+                self._mark_tainted_target(node.target)
+
+    def visit_AugAssign(self, node: ast.AugAssign):
         self.generic_visit(node)
-        if node.value is not None and self._is_tainted_expr(node.value):
+        if self._is_tainted_expr(node.value):
             self._mark_tainted_target(node.target)
 
     def visit_If(self, node: ast.If):
@@ -1431,6 +1566,9 @@ class SemanticChecker(ast.NodeVisitor):
 
     def analyze(self) -> List[Issue]:
         """Perform the complete analysis."""
+        self.issues = []
+        self.aliases = {}
+        self._deferred = []
         try:
             tree = ast.parse(self.source_code, filename=self.filename)
             self._collect_imports(tree)
@@ -1439,6 +1577,7 @@ class SemanticChecker(ast.NodeVisitor):
             self._with_expr_ids = set()
             self._push_scope('module')
             self.visit(tree)
+            self._run_deferred(0)
             self._pop_scope()
             self.issues = [issue for issue in self.issues if not self._is_ignored(issue)]
             return sorted(self.issues, key=lambda x: (x.line, x.col, x.code))
@@ -1578,9 +1717,33 @@ def write_baseline(issues: Sequence[Issue], path: str) -> None:
     Path(path).write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
 
 
-def git_staged_python_files() -> Tuple[List[str], Optional[str]]:
-    """Return staged *.py paths, or an error message."""
+def _display_path(path: Path) -> str:
+    """Path relative to cwd when it is underneath it, else absolute."""
     try:
+        rel = os.path.relpath(path, Path.cwd())
+    except ValueError:
+        return str(path)
+    if rel.startswith('..'):
+        return str(path)
+    return rel
+
+
+def git_staged_python_files() -> Tuple[List[str], Optional[str]]:
+    """Return staged *.py paths (relative to cwd), or an error message.
+
+    ``git diff --name-only`` prints paths relative to the repository root, not
+    the current directory, so the root is resolved first.
+    """
+    try:
+        toplevel = _subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if toplevel.returncode != 0:
+            detail = (toplevel.stderr or toplevel.stdout or 'not a git repository').strip()
+            return [], detail
         completed = _subprocess.run(
             ['git', 'diff', '--cached', '--name-only', '--diff-filter=ACMR'],
             capture_output=True,
@@ -1592,11 +1755,15 @@ def git_staged_python_files() -> Tuple[List[str], Optional[str]]:
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or 'git diff failed').strip()
         return [], detail
+    root = Path(toplevel.stdout.strip() or '.')
     files: List[str] = []
     for line in completed.stdout.splitlines():
         name = line.strip()
-        if name.endswith('.py') and Path(name).is_file():
-            files.append(name)
+        if not name.endswith('.py'):
+            continue
+        full = root / name
+        if full.is_file():
+            files.append(_display_path(full))
     return files, None
 
 
@@ -1729,10 +1896,13 @@ def format_issue(issue: Issue, source_line: str = '', use_color: bool = True) ->
         f"{color}{severity_str}{color_reset} [{issue.code}] "
         f"{issue.category}{origin}: {issue.message}\n"
     )
-    location = f"Line {issue.line}, Column {issue.col}"
-    if issue.filename:
+    # Issue.col is a 0-based character offset; humans expect 1-based columns.
+    location = f"Line {issue.line}, Column {issue.col + 1}" if issue.line > 0 else ''
+    if issue.filename and location:
         output += f"  {issue.filename}: {location}\n"
-    else:
+    elif issue.filename:
+        output += f"  {issue.filename}\n"
+    elif location:
         output += f"  {location}\n"
 
     if source_line:
@@ -1826,8 +1996,9 @@ def format_github_report(issues: Sequence[Issue]) -> str:
         file_part = issue.filename or ''
         end = f",endLine={issue.end_line}" if issue.end_line and issue.end_line != issue.line else ''
         suggestion = f" {issue.suggestion}" if issue.suggestion else ''
+        col = issue.col + 1 if issue.col >= 0 else 1
         lines.append(
-            f"::{level} file={file_part},line={issue.line},col={issue.col}{end}"
+            f"::{level} file={file_part},line={issue.line},col={col}{end}"
             f"::[{issue.code}] {issue.message}{suggestion}"
         )
     return '\n'.join(lines) + ('\n' if lines else '')
@@ -1849,10 +2020,11 @@ def format_sarif_report(issues: Sequence[Issue], tool_version: str) -> str:
     level_map = {'error': 'error', 'warning': 'warning', 'info': 'note'}
     results = []
     for issue in issues:
+        # SARIF columns are 1-based; Issue.col/end_col are 0-based offsets.
         start_line = issue.line if issue.line > 0 else 1
-        start_col = issue.col if issue.col > 0 else 1
+        start_col = issue.col + 1 if issue.col >= 0 else 1
         end_line = issue.end_line if issue.end_line > 0 else start_line
-        end_col = issue.end_col if issue.end_col > 0 else start_col
+        end_col = issue.end_col + 1 if issue.end_col > 0 else start_col
         message_text = issue.message
         if issue.suggestion:
             message_text = f"{issue.message} Suggestion: {issue.suggestion}"

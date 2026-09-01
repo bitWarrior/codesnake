@@ -46,6 +46,9 @@ Options:
     --test                  Run test suite
     --banner                Show CodeSnake banner
 
+Any other argument (files, directories, --bandit, --staged, --baseline FILE,
+--no-color, ...) is passed straight through to CodeSnake.
+
 Examples:
     $0 mycode.py                           # Check a file
     $0 -e --config .codesnake.json *.py    # Enhanced mode with config
@@ -65,7 +68,7 @@ create_venv() {
         rm -rf "${VENV_PATH}"
     fi
     
-    python3 -m venv "${VENV_PATH}"
+    "$PYTHON" -m venv "${VENV_PATH}"
     source "${VENV_PATH}/bin/activate"
     
     echo -e "${GREEN}Upgrading pip...${NC}"
@@ -110,11 +113,16 @@ activate_venv() {
 # Parse arguments
 USE_ENHANCED=false
 USE_VENV=true
-CONFIG_FILE=""
-FORMAT=""
-SEVERITY=""
 MODE="check"
-FILES=()
+PASSTHRU=()   # flags and files forwarded verbatim to CodeSnake
+
+# Read the value for an option that requires one; fail clearly if missing.
+need_value() {
+    if [ -z "${2:-}" ]; then
+        echo -e "${RED}Error: option '$1' requires a value${NC}" >&2
+        exit 2
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -131,15 +139,18 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -c|--config)
-            CONFIG_FILE="$2"
+            need_value "$1" "${2:-}"
+            PASSTHRU+=(--config "$2")
             shift 2
             ;;
         -f|--format)
-            FORMAT="$2"
+            need_value "$1" "${2:-}"
+            PASSTHRU+=(--format "$2")
             shift 2
             ;;
         -s|--severity)
-            SEVERITY="$2"
+            need_value "$1" "${2:-}"
+            PASSTHRU+=(--severity "$2")
             shift 2
             ;;
         --create-venv)
@@ -158,8 +169,15 @@ while [[ $# -gt 0 ]]; do
             MODE="banner"
             shift
             ;;
+        --)
+            shift
+            PASSTHRU+=("$@")
+            break
+            ;;
         *)
-            FILES+=("$1")
+            # Files, directories, and any other CodeSnake flag
+            # (--bandit, --staged, --baseline FILE, --no-color, ...).
+            PASSTHRU+=("$1")
             shift
             ;;
     esac
@@ -170,55 +188,28 @@ if [ "$USE_VENV" = true ]; then
     activate_venv
 fi
 
-# Build command based on mode
-if [ "$MODE" = "test" ]; then
-    # Run tests
-    if [ -f "${SCRIPT_DIR}/test/test_codesnake.py" ]; then
-        "$PYTHON" "${SCRIPT_DIR}/test/test_codesnake.py"
-    else
-        echo -e "${RED}Error: test/test_codesnake.py not found${NC}"
+case "$MODE" in
+    test)
+        if [ -f "${SCRIPT_DIR}/test/test_codesnake.py" ]; then
+            exec "$PYTHON" "${SCRIPT_DIR}/test/test_codesnake.py"
+        fi
+        echo -e "${RED}Error: test/test_codesnake.py not found${NC}" >&2
         exit 1
-    fi
-    
-elif [ "$MODE" = "banner" ]; then
-    # Show banner
-    if [ -f "${SCRIPT_DIR}/src/demo_banner.py" ]; then
-        "$PYTHON" "${SCRIPT_DIR}/src/demo_banner.py"
-    else
-        "$PYTHON" -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}/src'); from codesnake_banner import print_snake_banner; print_snake_banner()"
-    fi
-    
-elif [ "$MODE" = "version" ]; then
-    # Show version
-    "$PYTHON" -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}/src'); from codesnake_banner import print_version; print_version()"
-    
-else
-    # Check files
-    if [ "$USE_ENHANCED" = true ]; then
-        CMD="$PYTHON ${SCRIPT_DIR}/src/codesnake_enhanced.py"
-    else
-        CMD="$PYTHON ${SCRIPT_DIR}/src/codesnake.py"
-    fi
-    
-    # Add optional arguments
-    if [ -n "$CONFIG_FILE" ]; then
-        CMD="$CMD --config $CONFIG_FILE"
-    fi
-    
-    if [ -n "$FORMAT" ]; then
-        CMD="$CMD --format $FORMAT"
-    fi
-    
-    if [ -n "$SEVERITY" ]; then
-        CMD="$CMD --severity $SEVERITY"
-    fi
-    
-    # Add files
-    if [ ${#FILES[@]} -eq 0 ]; then
-        # No files specified - show help
-        eval "$CMD"
-    else
-        # Check specified files
-        eval "$CMD ${FILES[@]}"
-    fi
-fi
+        ;;
+    banner)
+        exec "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py" --banner
+        ;;
+    version)
+        exec "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py" --version
+        ;;
+    *)
+        if [ "$USE_ENHANCED" = true ]; then
+            ENTRY="${SCRIPT_DIR}/src/codesnake_enhanced.py"
+        else
+            ENTRY="${SCRIPT_DIR}/src/codesnake.py"
+        fi
+        # Arguments are passed as an array: paths with spaces or shell
+        # metacharacters are never re-parsed by the shell.
+        exec "$PYTHON" "$ENTRY" "${PASSTHRU[@]}"
+        ;;
+esac

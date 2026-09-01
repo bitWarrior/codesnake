@@ -1229,6 +1229,437 @@ class TestCrossFileAndBaseline(unittest.TestCase):
             self.assertTrue(issue['suggestion'])
 
 
+class TestScopeOrderingRegressions(unittest.TestCase):
+    """Function bodies are analyzed after the enclosing scope is fully bound."""
+
+    def test_closure_referencing_later_assignment(self):
+        code = """
+def f():
+    def g():
+        return x
+    x = 1
+    return g
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'VAR001'], [])
+
+    def test_lambda_referencing_later_assignment(self):
+        code = """
+def f():
+    cb = lambda: value
+    value = 3
+    return cb
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'VAR001'], [])
+
+    def test_deeply_nested_closure_chain(self):
+        code = """
+def a():
+    def b():
+        def c():
+            return outer_name
+        return c
+    outer_name = 1
+    return b
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'VAR001'], [])
+
+    def test_unused_local_still_reported_with_nested_function(self):
+        code = """
+def f():
+    def g():
+        return 1
+    unused = 2
+    return g
+"""
+        issues = SemanticChecker(code).analyze()
+        names = [i.message for i in issues if i.code == 'VAR001']
+        self.assertEqual(names, ["Unused local variable 'unused'"])
+
+    def test_decorator_uses_enclosing_argument(self):
+        code = """
+import functools
+def decorator(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code in ('VAR001', 'VAR002')], [])
+
+    def test_method_body_sees_module_import(self):
+        code = """
+import os
+class C:
+    def path(self):
+        return os.getcwd()
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+    def test_type_checking_state_preserved_in_deferred_body(self):
+        code = """
+from typing import TYPE_CHECKING
+def f():
+    if TYPE_CHECKING:
+        import os
+    return 1
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+    def test_unused_import_inside_function(self):
+        code = """
+def f():
+    import os
+    return 1
+"""
+        issues = SemanticChecker(code).analyze()
+        imp = [i for i in issues if i.code == 'IMP002']
+        self.assertEqual(len(imp), 1)
+        self.assertEqual(imp[0].line, 3)
+
+    def test_used_import_inside_function_ok(self):
+        code = """
+def f():
+    import os
+    return os.sep
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'IMP002'], [])
+
+    def test_analyze_is_idempotent(self):
+        checker = SemanticChecker("import os\n")
+        first = checker.analyze()
+        second = checker.analyze()
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(first), len(second))
+
+
+class TestSecurityCoverageRegressions(unittest.TestCase):
+
+    def test_os_system_tainted_is_error(self):
+        code = """
+import os
+cmd = input()
+os.system(cmd)
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC003']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'error')
+        self.assertIn('os.system', sec[0].message)
+
+    def test_os_system_constant_is_warning(self):
+        code = """
+import os
+os.system("ls -la")
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC003']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'warning')
+
+    def test_from_os_import_system_alias(self):
+        code = """
+from os import system as run_it
+import sys
+run_it(sys.argv[1])
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC003']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'error')
+
+    def test_os_popen_and_getoutput(self):
+        code = """
+import os, subprocess
+os.popen("ls")
+subprocess.getoutput("ls")
+subprocess.getstatusoutput("ls")
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC003']), 3)
+
+    def test_check_output_shell_true_tainted(self):
+        code = """
+import subprocess
+cmd = input()
+subprocess.check_output(cmd, shell=True)
+subprocess.check_call(cmd, shell=True)
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC003']
+        self.assertEqual(len(sec), 2)
+        self.assertTrue(all(i.severity == 'error' for i in sec))
+
+    def test_constant_reassigned_to_dynamic_value_is_error(self):
+        code = """
+x = "1+1"
+x = fetch()
+eval(x)
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC001']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'error')
+
+    def test_constant_still_downgraded_when_not_reassigned(self):
+        code = """
+x = "1+1"
+eval(x)
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC001']
+        self.assertEqual(sec[0].severity, 'info')
+
+    def test_augassign_propagates_taint(self):
+        code = """
+cmd = "echo "
+cmd += input()
+eval(cmd)
+"""
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC001']
+        self.assertEqual(len(sec), 1)
+        self.assertEqual(sec[0].severity, 'error')
+
+    def test_shell_constant_reassigned_to_false(self):
+        code = """
+import subprocess
+shell = True
+shell = False
+subprocess.run("ls", shell=shell)
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'SEC003'], [])
+
+
+class TestRuleAndOutputRegressions(unittest.TestCase):
+
+    def test_is_zero_not_style001(self):
+        code = """
+def f(x):
+    if x is 0:
+        return 1
+    if x is None:
+        return 2
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'STYLE001'], [])
+
+    def test_is_true_still_style001(self):
+        issues = SemanticChecker("def f(x):\n    return x is True\n").analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'STYLE001']), 1)
+
+    def test_except_star_handlers_checked(self):
+        if not hasattr(__import__('ast'), 'TryStar'):
+            self.skipTest('except* requires Python 3.11+')
+        code = """
+try:
+    pass
+except* ValueError:
+    pass
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'EXC003']), 1)
+
+    def test_lossy_raise_inside_match(self):
+        code = """
+try:
+    pass
+except KeyError:
+    match 1:
+        case 1:
+            raise ValueError("x")
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'EXC005']), 1)
+
+    def test_column_is_character_offset_not_bytes(self):
+        code = 's = "héllo"; eval(s)\n'
+        issues = SemanticChecker(code).analyze()
+        sec = [i for i in issues if i.code == 'SEC001'][0]
+        self.assertEqual(sec.col, code.index('eval'))
+        self.assertEqual(sec.end_col, code.index('eval(s)') + len('eval(s)'))
+
+    def test_text_output_caret_under_non_ascii_line(self):
+        from codesnake import format_issue
+        code = 's = "héllo"; eval(s)'
+        issue = SemanticChecker(code).analyze()[0]
+        rendered = format_issue(issue, code, use_color=False)
+        caret_line = [ln for ln in rendered.splitlines() if ln.strip() == '^'][0]
+        # Two leading spaces of indentation, then col spaces, then the caret.
+        self.assertEqual(len(caret_line) - 1, 2 + code.index('eval'))
+        self.assertIn(f"Column {code.index('eval') + 1}", rendered)
+
+    def test_sarif_and_github_columns_are_one_based(self):
+        from codesnake import format_github_report, format_sarif_report
+        issues = SemanticChecker("x = 1; eval('1')\n", filename='a.py').analyze()
+        sec = [i for i in issues if i.code == 'SEC001'][0]
+        self.assertEqual(sec.col, 7)
+        sarif = json.loads(format_sarif_report([sec], '0'))
+        region = sarif['runs'][0]['results'][0]['locations'][0]['physicalLocation']['region']
+        self.assertEqual(region['startColumn'], 8)
+        self.assertEqual(region['endColumn'], sec.end_col + 1)
+        github = format_github_report([sec])
+        self.assertIn(',col=8::', github)
+
+    def test_io_issue_text_has_no_bogus_location(self):
+        from codesnake import format_issue
+        from codesnake import _io_issue
+        rendered = format_issue(_io_issue('missing.py', 'File not found'), '', use_color=False)
+        self.assertNotIn('Line 0', rendered)
+        self.assertIn('missing.py', rendered)
+
+
+class TestConfigValidationRegressions(unittest.TestCase):
+
+    def _write(self, tmp, payload):
+        path = Path(tmp) / 'cfg.json'
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        return str(path)
+
+    def test_string_threshold_is_config_error(self):
+        from codesnake import ConfigError
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {"max_complexity": "10"})
+            with self.assertRaises(ConfigError) as ctx:
+                CheckerConfig.from_file(path)
+            self.assertIn('max_complexity', str(ctx.exception))
+            self.assertIn('int', str(ctx.exception))
+
+    def test_bool_field_rejects_int(self):
+        from codesnake import ConfigError
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {"check_security": 1})
+            with self.assertRaises(ConfigError):
+                CheckerConfig.from_file(path)
+
+    def test_int_field_rejects_bool(self):
+        from codesnake import ConfigError
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {"max_complexity": True})
+            with self.assertRaises(ConfigError):
+                CheckerConfig.from_file(path)
+
+    def test_unknown_key_warns_but_loads(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {"max_complexty": 3, "max_complexity": 4})
+            err = StringIO()
+            with patch('sys.stderr', err):
+                cfg = CheckerConfig.from_file(path)
+            self.assertEqual(cfg.max_complexity, 4)
+            self.assertIn('max_complexty', err.getvalue())
+
+    def test_bad_config_value_exits_one_via_run_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._write(tmp, {"max_function_params": "7"})
+            src = Path(tmp) / 'a.py'
+            src.write_text('x = 1\n', encoding='utf-8')
+            err = StringIO()
+            from unittest.mock import patch
+            with patch('sys.stderr', err):
+                rc = run_check(
+                    [str(src)],
+                    config_path=cfg,
+                    output_format='json',
+                    show_banner=False,
+                    color=False,
+                    stream=StringIO(),
+                )
+            self.assertEqual(rc, 1)
+            self.assertIn('max_function_params', err.getvalue())
+
+
+class TestStagedAndLauncherRegressions(unittest.TestCase):
+
+    def test_staged_paths_resolved_from_repo_root(self):
+        """git prints repo-root-relative paths; they must resolve from a subdir."""
+        import os
+        from unittest.mock import patch
+        from codesnake import git_staged_python_files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / 'pkg').mkdir()
+            (root / 'pkg' / 'mod.py').write_text('x = 1\n', encoding='utf-8')
+
+            class Done:
+                def __init__(self, stdout):
+                    self.returncode = 0
+                    self.stdout = stdout
+                    self.stderr = ''
+
+            def fake_run(cmd, **kwargs):
+                if cmd[:2] == ['git', 'rev-parse']:
+                    return Done(str(root) + '\n')
+                return Done('pkg/mod.py\nREADME.md\n')
+
+            old_cwd = os.getcwd()
+            os.chdir(root / 'pkg')
+            try:
+                with patch('codesnake._subprocess.run', side_effect=fake_run):
+                    files, error = git_staged_python_files()
+            finally:
+                os.chdir(old_cwd)
+            self.assertIsNone(error)
+            self.assertEqual(files, ['mod.py'])
+
+    def test_staged_git_failure_reported(self):
+        from unittest.mock import patch
+        from codesnake import git_staged_python_files
+
+        class Failed:
+            returncode = 128
+            stdout = ''
+            stderr = 'fatal: not a git repository\n'
+
+        with patch('codesnake._subprocess.run', return_value=Failed()):
+            files, error = git_staged_python_files()
+        self.assertEqual(files, [])
+        self.assertIn('not a git repository', error)
+
+    def test_launcher_handles_paths_with_spaces(self):
+        import shutil
+        import subprocess
+        if not shutil.which('bash'):
+            self.skipTest('bash not available')
+        launcher = Path(__file__).parent.parent / 'codesnake-launcher.sh'
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'has space' / 'a.py'
+            target.parent.mkdir()
+            target.write_text('x = 1\n', encoding='utf-8')
+            completed = subprocess.run(
+                ['bash', str(launcher), '--no-venv', '--no-color', str(target)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn('No issues found', completed.stdout)
+        self.assertNotIn('IO001', completed.stdout)
+
+    def test_launcher_missing_option_value_is_usage_error(self):
+        import shutil
+        import subprocess
+        if not shutil.which('bash'):
+            self.skipTest('bash not available')
+        launcher = Path(__file__).parent.parent / 'codesnake-launcher.sh'
+        completed = subprocess.run(
+            ['bash', str(launcher), '--no-venv', '--config'],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn('requires a value', completed.stderr)
+
+
 def run_tests():
     """Run all tests and print results."""
     loader = unittest.TestLoader()
