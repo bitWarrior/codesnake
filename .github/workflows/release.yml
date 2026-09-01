@@ -3,6 +3,14 @@ name: Release
 on:
   release:
     types: [published]
+  # A release event does not always dispatch a run, and a failed publish should
+  # not require recreating the GitHub Release. Both paths use the same guard.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v1.2.0 (must match src/codesnake/_version.py)"
+        required: true
+        type: string
 
 # Deny by default; each job grants only what it needs.
 permissions: {}
@@ -15,6 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Build the tag being released, never whatever the default branch is at.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -27,7 +37,7 @@ jobs:
 
       - name: Verify the built version matches the release tag
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           BUILT=$(python -c "import sys; sys.path.insert(0, 'src'); from codesnake._version import __version__; print(__version__)")
           echo "tag=$TAG built=$BUILT"
