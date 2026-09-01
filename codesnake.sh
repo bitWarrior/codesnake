@@ -18,6 +18,15 @@ VENV_NAME="codesnake-venv"
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    PYTHON=python
+else
+    echo -e "${RED}Error: Python 3 is not installed${NC}"
+    exit 1
+fi
+
 # Virtual environment path
 VENV_PATH="${SCRIPT_DIR}/${VENV_NAME}"
 
@@ -30,12 +39,14 @@ create_venv() {
     source "${VENV_PATH}/bin/activate"
     pip install --upgrade pip
     
-    # Install optional dependencies if user wants them
-    read -p "Install optional tools (pylint, flake8, mypy, bandit)? (y/N): " -n 1 -r
+    # Install this project from pyproject.toml
+    read -p "Install optional tools (pylint, flake8, mypy, bandit, isort)? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "${GREEN}Installing optional tools...${NC}"
-        pip install pylint flake8 mypy bandit
+        echo -e "${GREEN}Installing CodeSnake with optional tools...${NC}"
+        pip install -e "${SCRIPT_DIR}[tools]"
+    else
+        pip install -e "${SCRIPT_DIR}"
     fi
     
     echo -e "${GREEN}✓ Virtual environment created successfully!${NC}"
@@ -68,10 +79,10 @@ main() {
     # Run CodeSnake with all passed arguments
     if [ $# -eq 0 ]; then
         # No arguments - show help
-        python "${SCRIPT_DIR}/src/codesnake.py"
+        "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py"
     else
         # Pass all arguments to CodeSnake
-        python "${SCRIPT_DIR}/src/codesnake.py" "$@"
+        "$PYTHON" "${SCRIPT_DIR}/src/codesnake.py" "$@"
     fi
 }
 

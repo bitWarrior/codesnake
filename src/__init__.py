@@ -11,6 +11,24 @@ __version__ = "1.0.0"
 __author__ = "CodeSnake Contributors"
 __license__ = "MIT"
 
-from .codesnake import SemanticChecker, Issue
+from .codesnake import (
+    CheckerConfig,
+    ConfigError,
+    EnhancedSemanticChecker,
+    Issue,
+    SemanticChecker,
+    check_file,
+    load_config,
+    run_check,
+)
 
-__all__ = ['SemanticChecker', 'Issue']
+__all__ = [
+    'CheckerConfig',
+    'ConfigError',
+    'EnhancedSemanticChecker',
+    'Issue',
+    'SemanticChecker',
+    'check_file',
+    'load_config',
+    'run_check',
+]

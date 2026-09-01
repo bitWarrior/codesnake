@@ -6,14 +6,22 @@ Run with: python test/test_codesnake.py
 🐍 Testing CodeSnake's bite!
 """
 
-import unittest
+import json
 import sys
+import tempfile
+import unittest
+from io import StringIO
 from pathlib import Path
 
 # Add src directory to path to import codesnake
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from codesnake import SemanticChecker, Issue
+from codesnake import (
+    CheckerConfig,
+    SemanticChecker,
+    check_file,
+    run_check,
+)
 
 
 class TestSecurityChecks(unittest.TestCase):
@@ -59,6 +67,71 @@ call("ls -la", shell=True)
         sec_issues = [i for i in issues if i.code == 'SEC003']
         self.assertEqual(len(sec_issues), 1)
         self.assertIn('shell=True', sec_issues[0].message)
+
+    def test_subprocess_call_attribute(self):
+        """Test that subprocess.call(..., shell=True) is detected."""
+        code = """
+import subprocess
+subprocess.call("ls -la", shell=True)
+"""
+        issues = SemanticChecker(code).analyze()
+        sec_issues = [i for i in issues if i.code == 'SEC003']
+        self.assertEqual(len(sec_issues), 1)
+
+    def test_subprocess_run_alias(self):
+        """Test that import subprocess as sp still resolves shell=True."""
+        code = """
+import subprocess as sp
+sp.run("ls", shell=True)
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC003']), 1)
+
+    def test_other_object_run_not_flagged(self):
+        """Arbitrary .run(shell=True) is not subprocess."""
+        code = """
+obj.run("ls", shell=True)
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'SEC003'], [])
+
+    def test_pickle_loads_attribute(self):
+        """Test pickle.loads() detection."""
+        code = """
+import pickle
+pickle.loads(b"")
+"""
+        issues = SemanticChecker(code).analyze()
+        sec_issues = [i for i in issues if i.code == 'SEC002']
+        self.assertEqual(len(sec_issues), 1)
+        self.assertEqual(sec_issues[0].severity, 'warning')
+
+    def test_pickle_loads_from_import(self):
+        """Test from pickle import loads."""
+        code = """
+from pickle import loads
+loads(b"")
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC002']), 1)
+
+    def test_json_loads_not_pickle(self):
+        """json.loads must not be reported as pickle."""
+        code = """
+from json import loads
+loads("{}")
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'SEC002'], [])
+
+    def test_builtins_eval(self):
+        """builtins.eval() is still eval."""
+        code = """
+import builtins
+builtins.eval("1")
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'SEC001']), 1)
 
 
 class TestBugDetection(unittest.TestCase):
@@ -106,6 +179,30 @@ def append_item(item, lst=None):
         
         bug_issues = [i for i in issues if i.code == 'BUG001']
         self.assertEqual(len(bug_issues), 0)
+
+    def test_kwonly_mutable_default(self):
+        """Keyword-only mutable defaults should be flagged."""
+        code = """
+def f(*, x=[]):
+    return x
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'BUG001']), 1)
+
+    def test_set_call_default(self):
+        """set() / list() / dict() call defaults are mutable."""
+        code = """
+def f(x=set()):
+    return x
+"""
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'BUG001']), 1)
+
+    def test_lambda_mutable_default(self):
+        """Lambdas share the same default-argument check."""
+        code = "f = lambda x=[]: x\n"
+        issues = SemanticChecker(code).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'BUG001']), 1)
 
 
 class TestExceptionHandling(unittest.TestCase):
@@ -194,6 +291,58 @@ def complex_func(x):
         comp_issues = [i for i in issues if i.code == 'COMP002']
         self.assertEqual(len(comp_issues), 1)
         self.assertIn('complexity', comp_issues[0].message.lower())
+
+    def test_async_def_too_many_parameters_and_mutable_default(self):
+        """async def uses the same function analysis as def."""
+        code = """
+async def fetch(a, b, c, d, e, f, g, h, lst=[]):
+    return lst
+"""
+        issues = SemanticChecker(code).analyze()
+        codes = {i.code for i in issues}
+        self.assertIn('COMP001', codes)
+        self.assertIn('BUG001', codes)
+
+    def test_nested_function_does_not_inflate_parent_complexity(self):
+        """Nested function complexity must not be charged to the parent."""
+        code = """
+def outer(x):
+    def inner(y):
+        if y > 0:
+            if y > 10:
+                if y > 20:
+                    if y > 30:
+                        if y > 40:
+                            if y > 50:
+                                if y > 60:
+                                    if y > 70:
+                                        if y > 80:
+                                            if y > 90:
+                                                return "high"
+        return "low"
+    return inner(x)
+"""
+        checker = SemanticChecker(code)
+        issues = checker.analyze()
+        self.assertEqual(checker.function_complexity['outer'], 1)
+        self.assertGreater(checker.function_complexity['inner'], 10)
+        parent_flags = [
+            i for i in issues
+            if i.code == 'COMP002' and i.line == 2
+        ]
+        self.assertEqual(parent_flags, [])
+        self.assertEqual(len([i for i in issues if i.code == 'COMP002']), 1)
+
+    def test_posonlyargs_counted(self):
+        """Positional-only parameters count toward COMP001."""
+        code = """
+def func(a, b, c, d, e, f, g, /, h, i):
+    return a
+"""
+        issues = SemanticChecker(code).analyze()
+        comp_issues = [i for i in issues if i.code == 'COMP001']
+        self.assertEqual(len(comp_issues), 1)
+        self.assertIn('9 parameters', comp_issues[0].message)
 
 
 class TestImportChecks(unittest.TestCase):
@@ -304,22 +453,212 @@ def bad_function(a, b, c, d, e, f, g, h, lst=[]):
         self.assertIn('EXC001', codes)  # bare except
 
 
+class TestConfig(unittest.TestCase):
+    """Configuration is the source of thresholds and category toggles."""
+
+    def test_max_function_params_from_config(self):
+        code = """
+def func(a, b, c):
+    return a
+"""
+        default_issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in default_issues if i.code == 'COMP001'], [])
+
+        strict = CheckerConfig(max_function_params=2)
+        issues = SemanticChecker(code, config=strict).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'COMP001']), 1)
+        self.assertIn('max recommended: 2', issues[0].message)
+
+    def test_max_complexity_from_config(self):
+        code = """
+def func(x):
+    if x:
+        if x:
+            return 1
+    return 0
+"""
+        default_issues = SemanticChecker(code).analyze()
+        self.assertEqual([i.code for i in default_issues if i.code == 'COMP002'], [])
+
+        strict = CheckerConfig(max_complexity=1)
+        issues = SemanticChecker(code, config=strict).analyze()
+        self.assertEqual(len([i for i in issues if i.code == 'COMP002']), 1)
+
+    def test_check_security_false_skips_eval(self):
+        code = "eval('1')\n"
+        issues = SemanticChecker(code, config=CheckerConfig(check_security=False)).analyze()
+        self.assertEqual([i.code for i in issues if i.code == 'SEC001'], [])
+
+    def test_config_roundtrip_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'cfg.json'
+            original = CheckerConfig(max_function_length=40, report_info=False)
+            original.to_file(str(path))
+            loaded = CheckerConfig.from_file(str(path))
+            self.assertEqual(loaded.max_function_length, 40)
+            self.assertFalse(loaded.report_info)
+            self.assertTrue(loaded.check_security)
+
+
+class TestFailClosed(unittest.TestCase):
+    """Missing files, I/O errors, and syntax errors must not look clean."""
+
+    def test_missing_file_returns_io001(self):
+        issues = check_file('/no/such/codesnake_file.py')
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].code, 'IO001')
+        self.assertEqual(issues[0].severity, 'error')
+
+    def test_missing_file_exit_code(self):
+        buf = StringIO()
+        rc = run_check(
+            ['/no/such/codesnake_file.py'],
+            config=CheckerConfig(),
+            output_format='text',
+            show_banner=False,
+            color=False,
+            stream=buf,
+        )
+        self.assertEqual(rc, 1)
+        output = buf.getvalue()
+        self.assertIn('not found', output.lower())
+        self.assertNotIn('No issues found', output)
+
+    def test_directory_returns_io001(self):
+        issues = check_file('.')
+        self.assertTrue(issues)
+        self.assertEqual(issues[0].code, 'IO001')
+        self.assertEqual(run_check(
+            ['.'],
+            config=CheckerConfig(),
+            output_format='json',
+            show_banner=False,
+            color=False,
+            stream=StringIO(),
+        ), 1)
+
+    def test_syntax_error_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'broken.py'
+            path.write_text('def broken(:\n    pass\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(path)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertIn('SYN001', codes)
+
+
+class TestCLIOutput(unittest.TestCase):
+    """Multi-file checking and output formats."""
+
+    def test_json_format_contains_sec001(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'bad.py'
+            path.write_text('eval(1)\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(path)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertIn('SEC001', codes)
+            self.assertEqual(data['summary']['errors'], 1)
+
+    def test_multiple_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = Path(tmp) / 'clean.py'
+            dirty = Path(tmp) / 'dirty.py'
+            clean.write_text('x = 1\n', encoding='utf-8')
+            dirty.write_text('eval(1)\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(clean), str(dirty)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data['summary']['files'], 2)
+
+    def test_severity_filter_hides_info(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'assert_only.py'
+            path.write_text('assert True\n', encoding='utf-8')
+            buf = StringIO()
+            rc = run_check(
+                [str(path)],
+                config=CheckerConfig(),
+                output_format='json',
+                min_severity='error',
+                show_banner=False,
+                color=False,
+                stream=buf,
+            )
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            codes = [i['code'] for f in data['files'] for i in f['issues']]
+            self.assertNotIn('REL002', codes)
+
+    def test_invalid_config_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / 'bad.json'
+            cfg.write_text('{not json', encoding='utf-8')
+            rc = run_check(
+                ['whatever.py'],
+                config_path=str(cfg),
+                output_format='text',
+                show_banner=False,
+                color=False,
+                stream=StringIO(),
+            )
+            self.assertEqual(rc, 1)
+
+    def test_github_and_sarif_formats_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'bad.py'
+            path.write_text('eval(1)\n', encoding='utf-8')
+            for fmt in ('github', 'sarif'):
+                buf = StringIO()
+                rc = run_check(
+                    [str(path)],
+                    config=CheckerConfig(),
+                    output_format=fmt,
+                    show_banner=False,
+                    color=False,
+                    stream=buf,
+                )
+                self.assertEqual(rc, 1)
+                self.assertIn('SEC001', buf.getvalue())
+
+
 def run_tests():
     """Run all tests and print results."""
-    # Create a test suite
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    
-    # Add all test classes
-    suite.addTests(loader.loadTestsFromTestCase(TestSecurityChecks))
-    suite.addTests(loader.loadTestsFromTestCase(TestBugDetection))
-    suite.addTests(loader.loadTestsFromTestCase(TestExceptionHandling))
-    suite.addTests(loader.loadTestsFromTestCase(TestComplexityChecks))
-    suite.addTests(loader.loadTestsFromTestCase(TestImportChecks))
-    suite.addTests(loader.loadTestsFromTestCase(TestPerformanceChecks))
-    suite.addTests(loader.loadTestsFromTestCase(TestStyleChecks))
-    suite.addTests(loader.loadTestsFromTestCase(TestSyntaxErrors))
-    suite.addTests(loader.loadTestsFromTestCase(TestMultipleIssues))
+    for obj in list(globals().values()):
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, unittest.TestCase)
+            and obj is not unittest.TestCase
+        ):
+            suite.addTests(loader.loadTestsFromTestCase(obj))
     
     # Run tests
     runner = unittest.TextTestRunner(verbosity=2)

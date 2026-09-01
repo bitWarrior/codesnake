@@ -35,7 +35,7 @@ echo -e "${NC}\n"
 echo -e "${BLUE}[1/5] Checking Python version...${NC}"
 if ! command -v python3 &> /dev/null; then
     echo -e "${RED}Error: Python 3 is not installed${NC}"
-    echo -e "${YELLOW}Please install Python 3.7 or higher${NC}"
+    echo -e "${YELLOW}Please install Python 3.10 or higher${NC}"
     exit 1
 fi
 
@@ -69,24 +69,27 @@ echo -e "${BLUE}[3/5] Upgrading pip...${NC}"
 pip install --upgrade pip --quiet
 echo -e "${GREEN}✓ pip upgraded${NC}\n"
 
-# Install optional dependencies
-echo -e "${BLUE}[4/5] Optional Dependencies${NC}"
-echo -e "${YELLOW}CodeSnake works standalone, but integrates with these tools:${NC}"
+# Install this project from pyproject.toml
+echo -e "${BLUE}[4/5] Installing CodeSnake${NC}"
+echo -e "${YELLOW}CodeSnake works standalone, but can also install optional tools:${NC}"
 echo
 echo "  • pylint    - Advanced Python linter"
 echo "  • flake8    - Style guide enforcement (PEP 8)"
 echo "  • mypy      - Static type checker"
 echo "  • bandit    - Security vulnerability scanner"
+echo "  • isort     - Import sorting"
 echo
 
 read -p "Install optional tools? (recommended) (Y/n): " -n 1 -r
 echo
 if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-    echo -e "${YELLOW}Installing optional tools...${NC}"
-    pip install pylint flake8 mypy bandit --quiet
-    echo -e "${GREEN}✓ Optional tools installed${NC}"
+    echo -e "${YELLOW}Installing CodeSnake with optional tools (pyproject.toml)...${NC}"
+    pip install -e "${SCRIPT_DIR}[tools]" --quiet
+    echo -e "${GREEN}✓ CodeSnake and optional tools installed${NC}"
 else
-    echo -e "${YELLOW}Skipping optional tools${NC}"
+    echo -e "${YELLOW}Installing CodeSnake (no optional tools)...${NC}"
+    pip install -e "${SCRIPT_DIR}" --quiet
+    echo -e "${GREEN}✓ CodeSnake installed${NC}"
 fi
 echo
 
@@ -124,7 +127,7 @@ fi
 
 # Test installation
 echo -e "${BLUE}Testing CodeSnake installation...${NC}"
-if python "${SCRIPT_DIR}/codesnake.py" --help &> /dev/null || python "${SCRIPT_DIR}/codesnake.py" &> /dev/null; then
+if python3 "${SCRIPT_DIR}/src/codesnake.py" --help &> /dev/null; then
     echo -e "${GREEN}✓ CodeSnake is working!${NC}\n"
 else
     echo -e "${RED}Warning: Could not verify CodeSnake installation${NC}\n"

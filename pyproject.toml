@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codesnake"
+version = "1.0.0"
+description = "Semantic code checker for Python 3"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "CodeSnake Contributors" },
+]
+keywords = ["linter", "static-analysis", "ast", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# Runtime: stdlib only (ast, argparse, json, pathlib, dataclasses).
+dependencies = []
+
+[project.optional-dependencies]
+tools = [
+    "bandit>=1.9.3",
+    "flake8>=7.3.0",
+    "isort>=7.0.0",
+    "mypy>=1.19.1",
+    "pylint>=4.0.4",
+]
+dev = [
+    "codesnake[tools]",
+]
+
+[project.scripts]
+codesnake = "codesnake_cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = [
+    "codesnake",
+    "codesnake_banner",
+    "codesnake_cli",
+    "codesnake_enhanced",
+]

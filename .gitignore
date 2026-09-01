@@ -1,0 +1,19 @@
+# Virtual environment
+codesnake-venv/
+.venv/
+venv/
+
+# Packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# OS
+.DS_Store

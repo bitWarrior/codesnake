@@ -18,6 +18,15 @@ VENV_NAME="codesnake-venv"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 VENV_PATH="${SCRIPT_DIR}/${VENV_NAME}"
 
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    PYTHON=python
+else
+    echo -e "${RED}Error: Python 3 is not installed${NC}"
+    exit 1
+fi
+
 # Help message
 show_help() {
     cat << EOF
@@ -74,9 +83,12 @@ create_venv() {
     echo
     
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "${GREEN}Installing optional tools...${NC}"
-        pip install pylint flake8 mypy bandit --quiet
-        echo -e "${GREEN}✓ Optional tools installed${NC}"
+        echo -e "${GREEN}Installing CodeSnake with optional tools...${NC}"
+        pip install -e "${SCRIPT_DIR}[tools]" --quiet
+        echo -e "${GREEN}✓ CodeSnake and optional tools installed${NC}"
+    else
+        pip install -e "${SCRIPT_DIR}" --quiet
+        echo -e "${GREEN}✓ CodeSnake installed${NC}"
     fi
     
     echo -e "\n${GREEN}✓ Virtual environment created successfully!${NC}"
@@ -162,7 +174,7 @@ fi
 if [ "$MODE" = "test" ]; then
     # Run tests
     if [ -f "${SCRIPT_DIR}/test/test_codesnake.py" ]; then
-        python "${SCRIPT_DIR}/test/test_codesnake.py"
+        "$PYTHON" "${SCRIPT_DIR}/test/test_codesnake.py"
     else
         echo -e "${RED}Error: test/test_codesnake.py not found${NC}"
         exit 1
@@ -171,21 +183,21 @@ if [ "$MODE" = "test" ]; then
 elif [ "$MODE" = "banner" ]; then
     # Show banner
     if [ -f "${SCRIPT_DIR}/src/demo_banner.py" ]; then
-        python "${SCRIPT_DIR}/src/demo_banner.py"
+        "$PYTHON" "${SCRIPT_DIR}/src/demo_banner.py"
     else
-        python -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}/src'); from codesnake_banner import print_snake_banner; print_snake_banner()"
+        "$PYTHON" -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}/src'); from codesnake_banner import print_snake_banner; print_snake_banner()"
     fi
     
 elif [ "$MODE" = "version" ]; then
     # Show version
-    python -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}/src'); from codesnake_banner import print_version; print_version()"
+    "$PYTHON" -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}/src'); from codesnake_banner import print_version; print_version()"
     
 else
     # Check files
     if [ "$USE_ENHANCED" = true ]; then
-        CMD="python ${SCRIPT_DIR}/src/codesnake_enhanced.py"
+        CMD="$PYTHON ${SCRIPT_DIR}/src/codesnake_enhanced.py"
     else
-        CMD="python ${SCRIPT_DIR}/src/codesnake.py"
+        CMD="$PYTHON ${SCRIPT_DIR}/src/codesnake.py"
     fi
     
     # Add optional arguments
