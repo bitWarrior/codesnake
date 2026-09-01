@@ -286,11 +286,13 @@ def _parse_gitignore_text(text: str) -> List[_GitIgnorePattern]:
         dir_only = line.endswith('/')
         if dir_only:
             line = line[:-1]
-        anchored = line.startswith('/')
-        if anchored:
+        if line.startswith('/'):
             line = line[1:]
         if not line:
             continue
+        # git anchors a pattern to the .gitignore's own directory when it holds
+        # a separator anywhere but the end; only a bare name matches at any depth.
+        anchored = '/' in line
         parsed.append(_GitIgnorePattern(
             negated=negated,
             dir_only=dir_only,
@@ -1841,7 +1843,7 @@ def collect_module_exports(source: str) -> Set[str]:
     """Module-level names defined or re-exported in a file."""
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, RecursionError):
         return set()
     names: Set[str] = set()
     for node in tree.body:
@@ -2104,7 +2106,16 @@ def check_file(
         config=config,
         known_exports=known_exports,
     )
-    return checker.analyze()
+    try:
+        return checker.analyze()
+    except RecursionError:
+        # Analysis recurses per AST node, so source CPython parses happily can
+        # still exhaust the stack (long chained expressions, generated tables).
+        # Contain it here: one unanalyzable file must not sink the whole run.
+        return [_io_issue(
+            filepath,
+            f"'{filepath}' is nested too deeply to analyze - skipped",
+        )]
 
 
 # Per-worker state for the process pool (set once by the initializer so the

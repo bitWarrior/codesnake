@@ -5,7 +5,7 @@ codesnake/
 ├── pyproject.toml                Packaging: metadata, extras, console script
 ├── LICENSE                       MIT
 ├── README.md                     Primary documentation (install, usage, rules, API)
-├── .codesnake.json               Default configuration (what `codesnake config` writes)
+├── .codesnake.json               Default configuration (what `codesnake config` writes; it will not overwrite an existing file without `--force`)
 ├── setup.sh                      One-time venv + editable install
 ├── codesnake.sh                  Minimal launcher (activates venv, runs the CLI)
 ├── codesnake-launcher.sh         Launcher with --test / --create-venv / --no-venv

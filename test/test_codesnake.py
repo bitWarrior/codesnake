@@ -1981,6 +1981,43 @@ class TestPackageAndCli(unittest.TestCase):
             self.assertEqual(main(['check']), 2)
         self.assertIn('provide files', err.getvalue())
 
+    def test_deeply_nested_file_is_contained_not_fatal(self):
+        """One unanalyzable file must not sink the whole run."""
+        from codesnake import check_file, run_check
+        with tempfile.TemporaryDirectory() as tmp:
+            deep = Path(tmp) / 'chain.py'
+            deep.write_text(
+                'def f():\n    return ' + ' + '.join(str(i) for i in range(4000)) + '\n',
+                encoding='utf-8',
+            )
+            healthy = Path(tmp) / 'ok.py'
+            healthy.write_text('import os\n', encoding='utf-8')
+
+            issues = check_file(str(deep))
+            self.assertEqual([i.code for i in issues], ['IO001'])
+            self.assertIn('nested too deeply', issues[0].message)
+
+            out = StringIO()
+            run_check([str(deep), str(healthy)], stream=out, color=False)
+            self.assertIn('IMP002', out.getvalue())
+
+    def test_cli_config_refuses_to_clobber_without_force(self):
+        from unittest.mock import patch
+        from codesnake.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'c.json'
+            out.write_text('{"max_complexity": 99}\n', encoding='utf-8')
+            with patch('sys.stderr', StringIO()) as err:
+                self.assertEqual(main(['config', '-o', str(out)]), 1)
+            self.assertIn('--force', err.getvalue())
+            self.assertEqual(json.loads(out.read_text())['max_complexity'], 99)
+            with patch('sys.stdout', StringIO()):
+                self.assertEqual(main(['config', '-o', str(out), '--force']), 0)
+            self.assertEqual(
+                json.loads(out.read_text())['max_complexity'],
+                CheckerConfig().max_complexity,
+            )
+
     def test_cli_config_writes_defaults(self):
         from unittest.mock import patch
         from codesnake.cli import main
@@ -2119,6 +2156,31 @@ class TestGitignoreFromRepoRoot(unittest.TestCase):
             (pkg / 'deep' / 'keep.py').write_text('x = 1\n', encoding='utf-8')
             (pkg / 'deep' / 'drop.py').write_text('x = 1\n', encoding='utf-8')
             targets, _ = expand_python_targets([str(pkg / 'deep')])
+            self.assertEqual({Path(t).name for t in targets}, {'keep.py'})
+
+    def test_pattern_with_separator_is_anchored_to_its_gitignore(self):
+        """git anchors a pattern holding a separator; only bare names match at any depth."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / '.git').mkdir()
+            (root / '.gitignore').write_text('sub/drop.py\n', encoding='utf-8')
+            (root / 'sub').mkdir()
+            (root / 'other' / 'sub').mkdir(parents=True)
+            (root / 'sub' / 'drop.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'other' / 'sub' / 'drop.py').write_text('x = 1\n', encoding='utf-8')
+            targets, _ = expand_python_targets([str(root)])
+            relative = {Path(t).relative_to(root).as_posix() for t in targets}
+            self.assertEqual(relative, {'other/sub/drop.py'})
+
+    def test_bare_name_still_matches_at_any_depth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / '.git').mkdir()
+            (root / '.gitignore').write_text('drop.py\n', encoding='utf-8')
+            (root / 'deep' / 'deeper').mkdir(parents=True)
+            (root / 'deep' / 'deeper' / 'drop.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'deep' / 'deeper' / 'keep.py').write_text('x = 1\n', encoding='utf-8')
+            targets, _ = expand_python_targets([str(root)])
             self.assertEqual({Path(t).name for t in targets}, {'keep.py'})
 
     def test_without_repo_only_target_gitignore_applies(self):

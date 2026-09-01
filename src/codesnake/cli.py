@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import List, Optional, Sequence
 
 from .banner import print_snake_banner, print_version
@@ -92,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
         default='.codesnake.json',
         help='Output file (default: .codesnake.json)',
     )
+    config_parser.add_argument(
+        '--force',
+        '-f',
+        action='store_true',
+        help='Overwrite the output file if it already exists',
+    )
 
     subparsers.add_parser('version', help='Show version information')
     return parser
@@ -137,6 +144,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     if args.command == 'config':
+        # Writing defaults over a tuned config silently discards it.
+        if not args.force and Path(args.output).exists():
+            print(
+                f"Error: '{args.output}' already exists; pass --force to overwrite it",
+                file=sys.stderr,
+            )
+            return 1
         try:
             CheckerConfig().to_file(args.output)
         except OSError as exc:

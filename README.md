@@ -57,7 +57,7 @@ codesnake check --baseline .codesnake-baseline.json src/
 # Custom thresholds
 codesnake check --config .codesnake.json src/
 
-# Write a default config file
+# Write a default config file (refuses to overwrite; pass --force to replace)
 codesnake config -o .codesnake.json
 ```
 
