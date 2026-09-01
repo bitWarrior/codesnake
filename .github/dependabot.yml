@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Actions are SHA-pinned in the workflows, so this is what moves those pins.
+  # Without it, a pinned action never receives a security fix.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # CodeSnake has no runtime dependencies; this covers the optional [tools]
+  # and [dev] extras in pyproject.toml.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+    groups:
+      tools:
+        patterns: ["*"]
