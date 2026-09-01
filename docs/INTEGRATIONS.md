@@ -42,7 +42,7 @@ repos:
 ```
 
 To have pre-commit manage the install instead, use `language: python` with
-`additional_dependencies: ["git+https://github.com/bitWarrior/codesnake@v1.1.0"]`.
+`additional_dependencies: ["git+https://github.com/bitWarrior/codesnake@v1.2.0"]`.
 
 ## GitHub Actions
 
@@ -62,7 +62,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install "git+https://github.com/bitWarrior/codesnake@v1.1.0"
+      - run: pip install "git+https://github.com/bitWarrior/codesnake@v1.2.0"
       - run: codesnake check --format github --no-color src/
 ```
 
