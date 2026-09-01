@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import concurrent.futures
 import json
 import os
 import re
@@ -20,8 +21,19 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Pattern, Sequence, Set, TextIO, Tuple
 
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover - Python 3.10
+    tomllib = None  # type: ignore[assignment]
+
 from ._version import __version__
 from .banner import print_snake_banner
+
+PROJECT_URL = 'https://github.com/bitWarrior/codesnake'
+RULES_URL = PROJECT_URL + '#what-it-checks'
+
+# Below this many files a process pool costs more than it saves.
+PARALLEL_MIN_FILES = 8
 
 
 SEVERITY_RANK = {'error': 3, 'warning': 2, 'info': 1}
@@ -51,11 +63,21 @@ EVAL_EXEC_NAMES = frozenset({
 })
 
 PICKLE_LOAD_NAMES = frozenset({
-    'pickle.loads',
-    'pickle.load',
-    '_pickle.loads',
-    '_pickle.load',
+    'pickle.loads', 'pickle.load',
+    '_pickle.loads', '_pickle.load',
+    'dill.loads', 'dill.load',
+    'cloudpickle.loads', 'cloudpickle.load',
+    'jsonpickle.decode',
+    'marshal.loads', 'marshal.load',
+    'shelve.open',
+    'yaml.unsafe_load', 'yaml.unsafe_load_all',
 })
+
+UNPICKLER_NAMES = frozenset({'pickle.Unpickler', '_pickle.Unpickler', 'dill.Unpickler'})
+
+# yaml.load needs an explicit safe Loader; these loaders build arbitrary objects.
+YAML_LOAD_NAMES = frozenset({'yaml.load', 'yaml.load_all'})
+YAML_UNSAFE_LOADERS = frozenset({'yaml.Loader', 'yaml.UnsafeLoader'})
 
 SUBPROCESS_SHELL_NAMES = frozenset({
     'subprocess.call',
@@ -130,7 +152,8 @@ ABSTRACT_DECORATORS = frozenset({
 
 ISSUE_SUGGESTIONS = {
     'SEC001': 'Do not evaluate untrusted strings; use ast.literal_eval or a real parser.',
-    'SEC002': 'Avoid pickle for untrusted data; use json or a dedicated serializer.',
+    'SEC002': 'Avoid pickle/marshal/unsafe YAML for untrusted data; use json, yaml.safe_load, '
+              'or a dedicated serializer.',
     'SEC003': 'Pass a sequence of arguments with shell=False.',
     'SEC004': 'Pass a fixed executable and argument list, not a user-built command string.',
     'BUG001': 'Use None as the default and create the mutable object inside the function.',
@@ -276,32 +299,61 @@ def _parse_gitignore_text(text: str) -> List[_GitIgnorePattern]:
     return parsed
 
 
+_DirectoryView = List[Tuple[str, List[_GitIgnorePattern]]]
+
+
 class _IgnoreStack:
+    """Every .gitignore that applies to the walk, keyed by the directory it lives in.
+
+    Paths handed in must already be resolved (they come from ``os.walk`` over a
+    resolved root), so no per-file ``resolve()`` syscalls are needed.
+    """
+
     def __init__(self) -> None:
         self._entries: List[Tuple[Path, List[_GitIgnorePattern]]] = []
+        self._loaded: Set[Path] = set()
 
     def add_gitignore(self, gi_path: Path) -> None:
+        if gi_path in self._loaded:
+            return
+        self._loaded.add(gi_path)
         try:
             text = gi_path.read_text(encoding='utf-8')
         except OSError:
             return
-        self._entries.append((gi_path.parent.resolve(), _parse_gitignore_text(text)))
+        self._entries.append((gi_path.parent, _parse_gitignore_text(text)))
 
-    def ignored(self, path: Path, is_dir: bool) -> bool:
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        ignored = False
+    def view(self, directory: Path) -> _DirectoryView:
+        """Per-.gitignore relative prefixes for ``directory``, computed once per directory."""
+        views: _DirectoryView = []
         for base, patterns in self._entries:
             try:
-                rel = resolved.relative_to(base).as_posix()
+                rel = directory.relative_to(base).as_posix()
             except ValueError:
                 continue
+            views.append(('' if rel == '.' else rel + '/', patterns))
+        return views
+
+    @staticmethod
+    def ignored(views: _DirectoryView, name: str, is_dir: bool) -> bool:
+        ignored = False
+        for prefix, patterns in views:
+            rel = prefix + name
             for pattern in patterns:
                 if pattern.matches(rel, is_dir):
                     ignored = not pattern.negated
         return ignored
+
+
+_REPO_MARKERS = ('.git', '.hg', '.svn')
+
+
+def find_repo_root(start: Path) -> Optional[Path]:
+    """Nearest directory at or above ``start`` that contains a VCS marker."""
+    for candidate in (start, *start.parents):
+        if any((candidate / marker).exists() for marker in _REPO_MARKERS):
+            return candidate
+    return None
 
 
 def detect_source_encoding(data: bytes) -> str:
@@ -355,33 +407,37 @@ def iter_python_files(root: Path) -> Iterable[Path]:
     except OSError:
         root_resolved = root
     ignore = _IgnoreStack()
-    root_gi = root_resolved / '.gitignore'
-    if root_gi.is_file():
-        ignore.add_gitignore(root_gi)
+    # .gitignore files between the repository root and the target apply to
+    # everything below them, so load them first (top-most first).
+    chain = [root_resolved]
+    repo_root = find_repo_root(root_resolved)
+    if repo_root is not None and repo_root != root_resolved:
+        for parent in root_resolved.parents:
+            chain.append(parent)
+            if parent == repo_root:
+                break
+    for directory in reversed(chain):
+        gi_path = directory / '.gitignore'
+        if gi_path.is_file():
+            ignore.add_gitignore(gi_path)
 
     for dirpath, dirnames, filenames in os.walk(root_resolved):
         current = Path(dirpath)
         nested_gi = current / '.gitignore'
-        if nested_gi.is_file() and nested_gi != root_gi:
+        if nested_gi.is_file():
             ignore.add_gitignore(nested_gi)
+        views = ignore.view(current)
 
-        kept: List[str] = []
-        for name in dirnames:
-            if name in SKIP_DIR_NAMES or name.endswith('.egg-info'):
-                continue
-            sub = current / name
-            if ignore.ignored(sub, is_dir=True):
-                continue
-            kept.append(name)
-        dirnames[:] = kept
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in SKIP_DIR_NAMES
+            and not name.endswith('.egg-info')
+            and not _IgnoreStack.ignored(views, name, is_dir=True)
+        ]
 
         for name in filenames:
-            if not name.endswith('.py'):
-                continue
-            filepath = current / name
-            if ignore.ignored(filepath, is_dir=False):
-                continue
-            yield filepath
+            if name.endswith('.py') and not _IgnoreStack.ignored(views, name, is_dir=False):
+                yield current / name
 
 
 @dataclass
@@ -424,7 +480,16 @@ class CheckerConfig:
 
     @classmethod
     def from_file(cls, path: str) -> 'CheckerConfig':
+        """Load ``.codesnake.json`` or a ``pyproject.toml`` with a ``[tool.codesnake]`` table."""
         config_path = Path(path)
+        if config_path.suffix.lower() == '.toml':
+            if not config_path.is_file():
+                raise ConfigError(f"Config file '{path}' not found")
+            table = _pyproject_config(config_path)
+            if table is None:
+                raise ConfigError(f"'{path}' has no [tool.codesnake] table")
+            return cls.from_mapping(table, path)
+
         try:
             raw = config_path.read_text(encoding='utf-8')
         except FileNotFoundError:
@@ -439,7 +504,12 @@ class CheckerConfig:
 
         if not isinstance(data, dict):
             raise ConfigError(f"Config file '{path}' must contain a JSON object")
+        return cls.from_mapping(data, path)
 
+    @classmethod
+    def from_mapping(cls, data: Dict[str, Any], source: str = '<config>') -> 'CheckerConfig':
+        """Validate key names and value types; ``source`` names the origin in messages."""
+        path = source
         known = {item.name: item for item in fields(cls)}
         unknown = sorted(key for key in data if key not in known)
         if unknown:
@@ -489,14 +559,66 @@ class CheckerConfig:
         return bool(getattr(self, flag))
 
 
-def load_config(path: Optional[str] = None) -> CheckerConfig:
-    """Load config from an explicit path, else .codesnake.json in cwd, else defaults."""
+CONFIG_FILENAME = '.codesnake.json'
+PYPROJECT_FILENAME = 'pyproject.toml'
+_TOOL_TABLE_RE = re.compile(rb'^\s*\[tool\.codesnake\]', re.MULTILINE)
+
+
+def _pyproject_config(pyproject: Path) -> Optional[Dict[str, Any]]:
+    """The ``[tool.codesnake]`` table of ``pyproject`` or None when absent."""
+    try:
+        raw = pyproject.read_bytes()
+    except OSError:
+        return None
+    if tomllib is None:  # pragma: no cover - Python 3.10 only
+        if _TOOL_TABLE_RE.search(raw):
+            print(
+                f"Warning: '{pyproject}' has a [tool.codesnake] table but reading it "
+                "needs Python 3.11+; using defaults",
+                file=sys.stderr,
+            )
+        return None
+    try:
+        data = tomllib.loads(raw.decode('utf-8'))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"Invalid TOML in '{pyproject}': {exc}") from exc
+    tool = data.get('tool')
+    if not isinstance(tool, dict) or 'codesnake' not in tool:
+        return None
+    table = tool['codesnake']
+    if not isinstance(table, dict):
+        raise ConfigError(f"[tool.codesnake] in '{pyproject}' must be a table")
+    return table
+
+
+def discover_config_file(start: Optional[Path] = None) -> Optional[Path]:
+    """Find the config that applies to ``start`` (default: cwd).
+
+    Walks upward, stopping after the repository root. In each directory a
+    ``.codesnake.json`` wins over a ``pyproject.toml`` ``[tool.codesnake]`` table.
+    """
+    here = (start or Path.cwd()).resolve()
+    repo_root = find_repo_root(here)
+    for directory in (here, *here.parents):
+        json_path = directory / CONFIG_FILENAME
+        if json_path.is_file():
+            return json_path
+        pyproject = directory / PYPROJECT_FILENAME
+        if pyproject.is_file() and _pyproject_config(pyproject) is not None:
+            return pyproject
+        if repo_root is not None and directory == repo_root:
+            break
+    return None
+
+
+def load_config(path: Optional[str] = None, start: Optional[Path] = None) -> CheckerConfig:
+    """Explicit ``path`` if given; else the nearest discovered config; else defaults."""
     if path:
         return CheckerConfig.from_file(path)
-    default_path = Path('.codesnake.json')
-    if default_path.is_file():
-        return CheckerConfig.from_file(str(default_path))
-    return CheckerConfig()
+    found = discover_config_file(start)
+    if found is None:
+        return CheckerConfig()
+    return CheckerConfig.from_file(str(found))
 
 
 class SemanticChecker(ast.NodeVisitor):
@@ -1042,6 +1164,34 @@ class SemanticChecker(ast.NodeVisitor):
                 node,
                 'SEC002',
             )
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'load'
+            and isinstance(node.func.value, ast.Call)
+            and self._resolve_name(node.func.value.func) in UNPICKLER_NAMES
+        ):
+            unpickler = self._resolve_name(node.func.value.func)
+            self.add_issue(
+                'warning',
+                'security',
+                f"{unpickler}(...).load() can execute arbitrary code - use with caution",
+                node,
+                'SEC002',
+            )
+        elif resolved in YAML_LOAD_NAMES:
+            loader = next((kw.value for kw in node.keywords if kw.arg == 'Loader'), None)
+            if loader is None and len(node.args) >= 2:
+                loader = node.args[1]
+            loader_name = self._resolve_name(loader) if loader is not None else None
+            if loader is None or loader_name in YAML_UNSAFE_LOADERS:
+                self.add_issue(
+                    'warning',
+                    'security',
+                    f"{resolved}() without a safe Loader can execute arbitrary code - "
+                    "use yaml.safe_load()",
+                    node,
+                    'SEC002',
+                )
 
         if resolved in SUBPROCESS_SHELL_NAMES:
             cmd = node.args[0] if node.args else None
@@ -1750,8 +1900,43 @@ def _normalize_issue_path(filename: str) -> str:
         return path.as_posix()
 
 
-def issue_fingerprint(issue: Issue) -> str:
-    return f"{_normalize_issue_path(issue.filename)}|{issue.code}|{issue.message}"
+_DIGITS_RE = re.compile(r'\d+')
+BASELINE_VERSION = 2
+
+
+def normalize_issue_message(message: str) -> str:
+    """Replace numbers so 'Function is 52 lines long' and '... 53 lines long' match."""
+    return _DIGITS_RE.sub('#', message)
+
+
+def _fingerprint_key(filename: str, code: str, message: str) -> str:
+    return f"{_normalize_issue_path(filename)}|{code}|{normalize_issue_message(message)}"
+
+
+def issue_fingerprint(issue: Issue, occurrence: int = 0) -> str:
+    """``path|code|normalized message|occurrence``.
+
+    ``occurrence`` numbers repeated identical findings within one file, so a
+    baseline holding one ``eval(input())`` does not also hide a second one.
+    """
+    return f"{_fingerprint_key(issue.filename, issue.code, issue.message)}|{occurrence}"
+
+
+def issue_fingerprints(issues: Sequence[Issue]) -> List[str]:
+    """Fingerprints for a batch, numbering repeats in (file, line, col) order."""
+    order = sorted(
+        range(len(issues)),
+        key=lambda i: (_normalize_issue_path(issues[i].filename), issues[i].line, issues[i].col),
+    )
+    counts: Dict[str, int] = {}
+    result = [''] * len(issues)
+    for index in order:
+        issue = issues[index]
+        key = _fingerprint_key(issue.filename, issue.code, issue.message)
+        occurrence = counts.get(key, 0)
+        counts[key] = occurrence + 1
+        result[index] = f"{key}|{occurrence}"
+    return result
 
 
 def load_baseline(path: str) -> Set[str]:
@@ -1763,33 +1948,51 @@ def load_baseline(path: str) -> Set[str]:
         raise ConfigError(f"Baseline file '{path}' not found") from None
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"Could not read baseline '{path}': {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"Baseline '{path}' must contain a JSON object")
+    items = [item for item in data.get('issues') or [] if isinstance(item, dict)]
+    version = data.get('version') or 1
+
     fingerprints: Set[str] = set()
-    for item in data.get('issues') or []:
-        if not isinstance(item, dict):
-            continue
-        stored = item.get('fingerprint')
-        if stored:
-            fingerprints.add(str(stored))
-            continue
-        fingerprints.add(
-            f"{_normalize_issue_path(str(item.get('filename') or ''))}"
-            f"|{item.get('code') or ''}|{item.get('message') or ''}"
-        )
+    if isinstance(version, int) and version >= 2:
+        for item in items:
+            stored = item.get('fingerprint')
+            if stored:
+                fingerprints.add(str(stored))
+        return fingerprints
+
+    # Version 1 stored ``path|code|raw message`` with no occurrence index.
+    # Rebuild version-2 fingerprints; entries were written in (file, line) order.
+    counts: Dict[str, int] = {}
+    for item in items:
+        code = item.get('code')
+        message = item.get('message')
+        if code is not None and message is not None:
+            key = _fingerprint_key(str(item.get('filename') or ''), str(code), str(message))
+        else:
+            stored = str(item.get('fingerprint') or '')
+            if stored.count('|') < 2:
+                continue
+            stored_path, stored_code, stored_message = stored.split('|', 2)
+            key = f"{stored_path}|{stored_code}|{normalize_issue_message(stored_message)}"
+        occurrence = counts.get(key, 0)
+        counts[key] = occurrence + 1
+        fingerprints.add(f"{key}|{occurrence}")
     return fingerprints
 
 
 def write_baseline(issues: Sequence[Issue], path: str) -> None:
     payload = {
-        'version': 1,
+        'version': BASELINE_VERSION,
         'issues': [
             {
                 'filename': _normalize_issue_path(issue.filename),
                 'code': issue.code,
                 'message': issue.message,
                 'line': issue.line,
-                'fingerprint': issue_fingerprint(issue),
+                'fingerprint': fingerprint,
             }
-            for issue in issues
+            for issue, fingerprint in zip(issues, issue_fingerprints(issues))
         ],
     }
     Path(path).write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
@@ -1902,6 +2105,61 @@ def check_file(
         known_exports=known_exports,
     )
     return checker.analyze()
+
+
+# Per-worker state for the process pool (set once by the initializer so the
+# config and export map are not re-pickled for every file).
+_WORKER_CONFIG: Optional[CheckerConfig] = None
+_WORKER_EXPORTS: Dict[str, Set[str]] = {}
+
+
+def _init_worker(config: CheckerConfig, known_exports: Dict[str, Set[str]]) -> None:
+    global _WORKER_CONFIG, _WORKER_EXPORTS
+    _WORKER_CONFIG = config
+    _WORKER_EXPORTS = known_exports
+
+
+def _check_in_worker(item: Tuple[str, Optional[str]]) -> List[Issue]:
+    filepath, source = item
+    return check_file(filepath, config=_WORKER_CONFIG, known_exports=_WORKER_EXPORTS, source=source)
+
+
+def resolve_jobs(jobs: Optional[int], file_count: int) -> int:
+    """Worker count. ``None``/``0`` = auto: one per CPU once there are enough files."""
+    if file_count <= 1:
+        return 1
+    if jobs is None or jobs <= 0:
+        if file_count < PARALLEL_MIN_FILES:
+            return 1
+        return max(1, min(os.cpu_count() or 1, file_count))
+    return min(jobs, file_count)
+
+
+def analyze_files(
+    targets: Sequence[str],
+    config: CheckerConfig,
+    known_exports: Dict[str, Set[str]],
+    sources: Dict[str, str],
+    jobs: Optional[int] = None,
+) -> List[List[Issue]]:
+    """``check_file`` for every target, in order, using a process pool when worthwhile."""
+    items = [(filepath, sources.get(filepath)) for filepath in targets]
+    workers = resolve_jobs(jobs, len(items))
+    if workers > 1:
+        try:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_worker,
+                initargs=(config, known_exports),
+            ) as pool:
+                chunksize = max(1, len(items) // (workers * 4))
+                return list(pool.map(_check_in_worker, items, chunksize=chunksize))
+        except Exception:  # noqa: EXC002 - any pool failure: redo sequentially, which surfaces real bugs
+            pass
+    return [
+        check_file(filepath, config=config, known_exports=known_exports, source=source)
+        for filepath, source in items
+    ]
 
 
 _BANDIT_SEVERITY = {
@@ -2070,36 +2328,75 @@ def format_json_report(
     return json.dumps(payload, indent=2) + '\n'
 
 
+def _gh_escape_data(value: str) -> str:
+    """Escape a workflow-command message (GitHub's documented rules)."""
+    return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+
+def _gh_escape_property(value: str) -> str:
+    """Escape a workflow-command property value (``file=``, ``title=`` ...)."""
+    return _gh_escape_data(value).replace(':', '%3A').replace(',', '%2C')
+
+
 def format_github_report(issues: Sequence[Issue]) -> str:
     lines = []
     level_map = {'error': 'error', 'warning': 'warning', 'info': 'notice'}
     for issue in issues:
         level = level_map.get(issue.severity, 'warning')
-        file_part = issue.filename or ''
-        end = f",endLine={issue.end_line}" if issue.end_line and issue.end_line != issue.line else ''
-        suggestion = f" {issue.suggestion}" if issue.suggestion else ''
+        props = [f"file={_gh_escape_property(issue.filename or '')}", f"line={issue.line}"]
         col = issue.col + 1 if issue.col >= 0 else 1
-        lines.append(
-            f"::{level} file={file_part},line={issue.line},col={col}{end}"
-            f"::[{issue.code}] {issue.message}{suggestion}"
-        )
+        props.append(f"col={col}")
+        if issue.end_line and issue.end_line != issue.line:
+            props.append(f"endLine={issue.end_line}")
+        elif issue.end_col > issue.col:
+            props.append(f"endColumn={issue.end_col + 1}")
+        props.append(f"title={_gh_escape_property(f'{issue.code} {issue.category}')}")
+        message = f"[{issue.code}] {issue.message}"
+        if issue.suggestion:
+            message += f" {issue.suggestion}"
+        lines.append(f"::{level} {','.join(props)}::{_gh_escape_data(message)}")
     return '\n'.join(lines) + ('\n' if lines else '')
 
 
+def _sarif_uri(filename: str) -> str:
+    """Relative POSIX path under cwd, otherwise an absolute ``file://`` URI."""
+    if not filename:
+        return ''
+    path = Path(filename)
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return path.as_posix()
+    try:
+        return resolved.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        try:
+            return resolved.as_uri()
+        except ValueError:
+            return path.as_posix()
+
+
 def format_sarif_report(issues: Sequence[Issue], tool_version: str) -> str:
+    level_map = {'error': 'error', 'warning': 'warning', 'info': 'note'}
     rules = []
     seen_codes = set()
     for issue in issues:
         if issue.code in seen_codes:
             continue
         seen_codes.add(issue.code)
-        rules.append({
+        rule: Dict[str, Any] = {
             'id': issue.code,
             'name': issue.code,
-            'shortDescription': {'text': issue.category},
-        })
+            'shortDescription': {'text': f"{issue.category}: {issue.code}"},
+            'helpUri': RULES_URL,
+            'defaultConfiguration': {'level': level_map.get(issue.severity, 'warning')},
+            'properties': {'category': issue.category},
+        }
+        suggestion = issue.suggestion or ISSUE_SUGGESTIONS.get(issue.code)
+        if suggestion:
+            rule['fullDescription'] = {'text': suggestion}
+        rules.append(rule)
 
-    level_map = {'error': 'error', 'warning': 'warning', 'info': 'note'}
     results = []
     for issue in issues:
         # SARIF columns are 1-based; Issue.col/end_col are 0-based offsets.
@@ -2116,7 +2413,7 @@ def format_sarif_report(issues: Sequence[Issue], tool_version: str) -> str:
             'message': {'text': message_text},
             'locations': [{
                 'physicalLocation': {
-                    'artifactLocation': {'uri': issue.filename or ''},
+                    'artifactLocation': {'uri': _sarif_uri(issue.filename)},
                     'region': {
                         'startLine': start_line,
                         'startColumn': start_col,
@@ -2135,6 +2432,7 @@ def format_sarif_report(issues: Sequence[Issue], tool_version: str) -> str:
                 'driver': {
                     'name': 'CodeSnake',
                     'version': tool_version,
+                    'informationUri': PROJECT_URL,
                     'rules': rules,
                 },
             },
@@ -2168,8 +2466,12 @@ def run_check(
     staged: bool = False,
     baseline_path: Optional[str] = None,
     update_baseline: Optional[str] = None,
+    jobs: Optional[int] = None,
 ) -> int:
-    """Analyze one or more files. Returns 1 if any error-severity issue exists."""
+    """Analyze one or more files. Returns 1 if any error-severity issue exists.
+
+    ``jobs``: worker processes (``None``/``0`` = auto, ``1`` = sequential).
+    """
     out = stream if stream is not None else sys.stdout
 
     try:
@@ -2220,16 +2522,10 @@ def run_check(
         except OSError:
             known_exports[filepath] = collect_module_exports(source)
 
-    for filepath in targets:
-        source = sources_by_file.get(filepath)
-        issues = check_file(
-            filepath,
-            config=config,
-            known_exports=known_exports,
-            source=source,
-        )
+    results = analyze_files(targets, config, known_exports, sources_by_file, jobs=jobs)
+    for filepath, issues in zip(targets, results):
         issues = filter_issues(issues, config, min_severity=min_severity)
-        file_reports.append((filepath, issues, source))
+        file_reports.append((filepath, issues, sources_by_file.get(filepath)))
 
     run_bandit = config.use_bandit if use_bandit is None else use_bandit
     if run_bandit and targets:
@@ -2269,14 +2565,14 @@ def run_check(
         except ConfigError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        file_reports = [
-            (
-                filepath,
-                [issue for issue in issues if issue_fingerprint(issue) not in fingerprints],
-                source,
-            )
-            for filepath, issues, source in file_reports
-        ]
+        filtered_reports: List[Tuple[str, List[Issue], Optional[str]]] = []
+        for filepath, issues, source in file_reports:
+            keep = [
+                issue for issue, fingerprint in zip(issues, issue_fingerprints(issues))
+                if fingerprint not in fingerprints
+            ]
+            filtered_reports.append((filepath, keep, source))
+        file_reports = filtered_reports
 
     displayed: List[Tuple[str, List[Issue]]] = [
         (path, issues) for path, issues, _ in file_reports

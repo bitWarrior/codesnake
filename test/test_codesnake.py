@@ -1506,7 +1506,7 @@ except KeyError:
         self.assertEqual(region['startColumn'], 8)
         self.assertEqual(region['endColumn'], sec.end_col + 1)
         github = format_github_report([sec])
-        self.assertIn(',col=8::', github)
+        self.assertIn(',col=8,', github)
 
     def test_io_issue_text_has_no_bogus_location(self):
         from codesnake import format_issue
@@ -2002,6 +2002,333 @@ class TestPackageAndCli(unittest.TestCase):
         from codesnake import __version__
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(__version__, completed.stdout)
+
+
+class TestConfigDiscovery(unittest.TestCase):
+
+    def _repo(self, tmp):
+        root = Path(tmp).resolve()
+        (root / '.git').mkdir()
+        (root / 'pkg' / 'sub').mkdir(parents=True)
+        return root
+
+    def test_json_found_walking_up_from_subdirectory(self):
+        from codesnake import discover_config_file, load_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            (root / '.codesnake.json').write_text('{"max_complexity": 3}', encoding='utf-8')
+            found = discover_config_file(root / 'pkg' / 'sub')
+            self.assertEqual(found, root / '.codesnake.json')
+            self.assertEqual(load_config(start=root / 'pkg' / 'sub').max_complexity, 3)
+
+    def test_pyproject_tool_table(self):
+        from codesnake import checker, discover_config_file, load_config
+        if checker.tomllib is None:
+            self.skipTest('tomllib requires Python 3.11+')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            (root / 'pyproject.toml').write_text(
+                '[project]\nname = "x"\n\n[tool.codesnake]\nmax_function_params = 3\n'
+                'check_style = false\n', encoding='utf-8')
+            self.assertEqual(discover_config_file(root / 'pkg'), root / 'pyproject.toml')
+            cfg = load_config(start=root / 'pkg')
+            self.assertEqual(cfg.max_function_params, 3)
+            self.assertFalse(cfg.check_style)
+
+    def test_pyproject_without_table_is_skipped(self):
+        from codesnake import checker, discover_config_file
+        if checker.tomllib is None:
+            self.skipTest('tomllib requires Python 3.11+')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            (root / 'pyproject.toml').write_text('[project]\nname = "x"\n', encoding='utf-8')
+            self.assertIsNone(discover_config_file(root / 'pkg'))
+
+    def test_json_preferred_over_pyproject_in_same_directory(self):
+        from codesnake import checker, load_config
+        if checker.tomllib is None:
+            self.skipTest('tomllib requires Python 3.11+')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            (root / '.codesnake.json').write_text('{"max_complexity": 4}', encoding='utf-8')
+            (root / 'pyproject.toml').write_text('[tool.codesnake]\nmax_complexity = 9\n', encoding='utf-8')
+            self.assertEqual(load_config(start=root).max_complexity, 4)
+
+    def test_search_stops_at_repository_root(self):
+        from codesnake import discover_config_file
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = Path(tmp).resolve()
+            (outer / '.codesnake.json').write_text('{"max_complexity": 1}', encoding='utf-8')
+            repo = outer / 'repo'
+            repo.mkdir()
+            (repo / '.git').mkdir()
+            (repo / 'pkg').mkdir()
+            self.assertIsNone(discover_config_file(repo / 'pkg'))
+
+    def test_explicit_toml_path(self):
+        from codesnake import CheckerConfig, ConfigError, checker
+        if checker.tomllib is None:
+            self.skipTest('tomllib requires Python 3.11+')
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / 'pyproject.toml'
+            good.write_text('[tool.codesnake]\nmax_class_methods = 2\n', encoding='utf-8')
+            self.assertEqual(CheckerConfig.from_file(str(good)).max_class_methods, 2)
+            bad = Path(tmp) / 'bad.toml'
+            bad.write_text('[tool.codesnake\n', encoding='utf-8')
+            with self.assertRaises(ConfigError):
+                CheckerConfig.from_file(str(bad))
+            empty = Path(tmp) / 'empty.toml'
+            empty.write_text('[project]\n', encoding='utf-8')
+            with self.assertRaises(ConfigError):
+                CheckerConfig.from_file(str(empty))
+
+    def test_toml_values_are_validated(self):
+        from codesnake import CheckerConfig, ConfigError, checker
+        if checker.tomllib is None:
+            self.skipTest('tomllib requires Python 3.11+')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'pyproject.toml'
+            path.write_text('[tool.codesnake]\nmax_complexity = "ten"\n', encoding='utf-8')
+            with self.assertRaises(ConfigError):
+                CheckerConfig.from_file(str(path))
+
+
+class TestGitignoreFromRepoRoot(unittest.TestCase):
+
+    def test_root_gitignore_applies_to_subdirectory_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / '.git').mkdir()
+            (root / '.gitignore').write_text('generated/\n*_pb2.py\n', encoding='utf-8')
+            src = root / 'src'
+            (src / 'generated').mkdir(parents=True)
+            (src / 'a.py').write_text('x = 1\n', encoding='utf-8')
+            (src / 'proto_pb2.py').write_text('x = 1\n', encoding='utf-8')
+            (src / 'generated' / 'g.py').write_text('x = 1\n', encoding='utf-8')
+            targets, _ = expand_python_targets([str(src)])
+            self.assertEqual({Path(t).name for t in targets}, {'a.py'})
+
+    def test_intermediate_gitignore_and_negation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / '.git').mkdir()
+            (root / '.gitignore').write_text('*.py\n', encoding='utf-8')
+            pkg = root / 'pkg'
+            (pkg / 'deep').mkdir(parents=True)
+            (pkg / '.gitignore').write_text('!keep.py\n', encoding='utf-8')
+            (pkg / 'deep' / 'keep.py').write_text('x = 1\n', encoding='utf-8')
+            (pkg / 'deep' / 'drop.py').write_text('x = 1\n', encoding='utf-8')
+            targets, _ = expand_python_targets([str(pkg / 'deep')])
+            self.assertEqual({Path(t).name for t in targets}, {'keep.py'})
+
+    def test_without_repo_only_target_gitignore_applies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = Path(tmp).resolve()
+            (outer / '.gitignore').write_text('*.py\n', encoding='utf-8')
+            (outer / 'proj').mkdir()
+            (outer / 'proj' / 'a.py').write_text('x = 1\n', encoding='utf-8')
+            targets, _ = expand_python_targets([str(outer / 'proj')])
+            self.assertEqual({Path(t).name for t in targets}, {'a.py'})
+
+
+class TestBaselineFingerprints(unittest.TestCase):
+
+    def _run(self, files, **kwargs):
+        buf = StringIO()
+        rc = run_check(files, config=CheckerConfig(), output_format='json',
+                       show_banner=False, color=False, stream=buf, **kwargs)
+        data = json.loads(buf.getvalue())
+        return rc, [i['code'] for f in data['files'] for i in f['issues']]
+
+    def test_numbers_normalized(self):
+        from codesnake import normalize_issue_message
+        self.assertEqual(normalize_issue_message('Function is 52 lines long (max 50)'),
+                         'Function is # lines long (max #)')
+
+    def test_count_change_in_message_stays_suppressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'long.py'
+            body = ''.join(f'    v{i} = {i}\n' for i in range(55))
+            path.write_text('def f():\n' + body + '    return 0\n', encoding='utf-8')
+            baseline = str(Path(tmp) / 'b.json')
+            self._run([str(path)], update_baseline=baseline)
+            path.write_text('def f():\n' + body + '    w = 1\n    return w\n', encoding='utf-8')
+            _, codes = self._run([str(path)], baseline_path=baseline)
+            self.assertNotIn('COMP003', codes)
+
+    def test_second_identical_violation_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.py'
+            path.write_text('eval(input())\n', encoding='utf-8')
+            baseline = str(Path(tmp) / 'b.json')
+            self._run([str(path)], update_baseline=baseline)
+            path.write_text('eval(input())\neval(input())\n', encoding='utf-8')
+            rc, codes = self._run([str(path)], baseline_path=baseline)
+            self.assertEqual(codes.count('SEC001'), 1)
+            self.assertEqual(rc, 1)
+
+    def test_removing_first_duplicate_does_not_unhide_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.py'
+            path.write_text('eval(input())\nx = 1\neval(input())\n', encoding='utf-8')
+            baseline = str(Path(tmp) / 'b.json')
+            self._run([str(path)], update_baseline=baseline)
+            path.write_text('x = 1\neval(input())\n', encoding='utf-8')
+            _, codes = self._run([str(path)], baseline_path=baseline)
+            self.assertNotIn('SEC001', codes)
+
+    def test_version_1_baseline_still_loads(self):
+        from codesnake import issue_fingerprints
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.py'
+            path.write_text('eval(input())\n', encoding='utf-8')
+            issues = check_file(str(path))
+            sec = [i for i in issues if i.code == 'SEC001'][0]
+            legacy = {
+                'version': 1,
+                'issues': [{
+                    'filename': str(path),
+                    'code': sec.code,
+                    'message': sec.message,
+                    'line': sec.line,
+                    'fingerprint': f'{path}|{sec.code}|{sec.message}',
+                }],
+            }
+            baseline = Path(tmp) / 'legacy.json'
+            baseline.write_text(json.dumps(legacy), encoding='utf-8')
+            loaded = load_baseline(str(baseline))
+            self.assertIn(issue_fingerprints([sec])[0], loaded)
+            _, codes = self._run([str(path)], baseline_path=str(baseline))
+            self.assertNotIn('SEC001', codes)
+
+    def test_written_baseline_is_version_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.py'
+            path.write_text('eval(input())\n', encoding='utf-8')
+            baseline = Path(tmp) / 'b.json'
+            self._run([str(path)], update_baseline=str(baseline))
+            data = json.loads(baseline.read_text())
+            self.assertEqual(data['version'], 2)
+            self.assertTrue(data['issues'][0]['fingerprint'].endswith('|0'))
+
+
+class TestReportFormatting(unittest.TestCase):
+
+    def _issue(self, **kw):
+        from codesnake import Issue
+        base = dict(severity='warning', category='security', message='m', line=3, col=4,
+                    code='SEC003', filename='a.py', end_line=3, end_col=9, suggestion='')
+        base.update(kw)
+        return Issue(**base)
+
+    def test_github_escapes_message_and_properties(self):
+        from codesnake import format_github_report
+        out = format_github_report([self._issue(
+            filename='dir,with:odd.py', message='50% done\nsecond line', suggestion='')])
+        self.assertIn('file=dir%2Cwith%3Aodd.py', out)
+        self.assertIn('50%25 done%0Asecond line', out)
+        self.assertNotIn('\n', out.rstrip('\n'))
+        self.assertIn(',endColumn=10,', out)
+        self.assertIn('title=SEC003 security', out)
+
+    def test_sarif_metadata_and_uris(self):
+        from codesnake import format_sarif_report
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp).resolve() / 'x.py'
+            outside.write_text('x = 1\n', encoding='utf-8')
+            sarif = json.loads(format_sarif_report([
+                self._issue(filename='src/codesnake/checker.py'),
+                self._issue(filename=str(outside), code='BUG001', severity='error',
+                            category='bugs'),
+            ], '9.9'))
+        driver = sarif['runs'][0]['tool']['driver']
+        self.assertTrue(driver['informationUri'].startswith('https://'))
+        rules = {r['id']: r for r in driver['rules']}
+        self.assertEqual(rules['SEC003']['defaultConfiguration']['level'], 'warning')
+        self.assertEqual(rules['BUG001']['defaultConfiguration']['level'], 'error')
+        self.assertIn('helpUri', rules['SEC003'])
+        self.assertIn('fullDescription', rules['BUG001'])
+        uris = [r['locations'][0]['physicalLocation']['artifactLocation']['uri']
+                for r in sarif['runs'][0]['results']]
+        self.assertEqual(uris[0], 'src/codesnake/checker.py')
+        self.assertTrue(uris[1].startswith('file:///'), uris[1])
+
+
+class TestDeserializationSinks(unittest.TestCase):
+
+    def _sec002(self, code):
+        return [i for i in SemanticChecker(code).analyze() if i.code == 'SEC002']
+
+    def test_yaml_load_without_loader(self):
+        self.assertEqual(len(self._sec002("import yaml\nyaml.load(s)\n")), 1)
+        self.assertEqual(len(self._sec002("from yaml import load\nload(s)\n")), 1)
+
+    def test_yaml_load_with_unsafe_loader(self):
+        self.assertEqual(len(self._sec002("import yaml\nyaml.load(s, Loader=yaml.Loader)\n")), 1)
+        self.assertEqual(len(self._sec002("import yaml\nyaml.load(s, yaml.UnsafeLoader)\n")), 1)
+        self.assertEqual(len(self._sec002("import yaml\nyaml.unsafe_load(s)\n")), 1)
+
+    def test_yaml_safe_variants_ok(self):
+        self.assertEqual(self._sec002("import yaml\nyaml.safe_load(s)\n"), [])
+        self.assertEqual(self._sec002("import yaml\nyaml.load(s, Loader=yaml.SafeLoader)\n"), [])
+        self.assertEqual(self._sec002("import yaml\nyaml.load(s, Loader=yaml.FullLoader)\n"), [])
+
+    def test_marshal_shelve_dill(self):
+        code = """
+import marshal, shelve, dill
+marshal.loads(b)
+shelve.open(p)
+dill.loads(b)
+"""
+        self.assertEqual(len(self._sec002(code)), 3)
+
+    def test_unpickler_load(self):
+        code = """
+import pickle
+with open(p, 'rb') as fh:
+    pickle.Unpickler(fh).load()
+"""
+        sec = self._sec002(code)
+        self.assertEqual(len(sec), 1)
+        self.assertIn('Unpickler', sec[0].message)
+
+    def test_unrelated_load_not_flagged(self):
+        self.assertEqual(self._sec002("import json\njson.load(fh)\nmodel.load()\n"), [])
+
+
+class TestParallelAnalysis(unittest.TestCase):
+
+    def test_resolve_jobs(self):
+        from codesnake import resolve_jobs
+        self.assertEqual(resolve_jobs(None, 1), 1)
+        self.assertEqual(resolve_jobs(None, 3), 1)
+        self.assertGreaterEqual(resolve_jobs(None, 50), 1)
+        self.assertEqual(resolve_jobs(4, 2), 2)
+        self.assertEqual(resolve_jobs(1, 100), 1)
+        self.assertEqual(resolve_jobs(0, 3), 1)
+
+    def test_parallel_matches_sequential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = []
+            for i in range(6):
+                path = Path(tmp) / f'm{i}.py'
+                path.write_text(f'import os\ndef f{i}(a, b=[]):\n    eval(input())\n', encoding='utf-8')
+                files.append(str(path))
+            outputs = []
+            for jobs in (1, 2):
+                buf = StringIO()
+                rc = run_check(files, config=CheckerConfig(), output_format='json',
+                               show_banner=False, color=False, stream=buf, jobs=jobs)
+                self.assertEqual(rc, 1)
+                outputs.append(buf.getvalue())
+            self.assertEqual(outputs[0], outputs[1])
+            self.assertEqual(json.loads(outputs[1])['summary']['errors'], 12)
+
+    def test_cli_jobs_flag(self):
+        from codesnake.cli import build_parser
+        args = build_parser().parse_args(['check', '-j', '2', 'a.py'])
+        self.assertEqual(args.jobs, 2)
+        self.assertIsNone(build_parser().parse_args(['check', 'a.py']).jobs)
 
 
 def run_tests():

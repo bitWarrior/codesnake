@@ -65,7 +65,7 @@ codesnake config -o .codesnake.json
 
 | Flag | Meaning |
 |---|---|
-| `--config PATH` | Config JSON (otherwise `.codesnake.json` in the current directory, else defaults) |
+| `--config PATH` | `.codesnake.json` or a `pyproject.toml` with `[tool.codesnake]` (otherwise the nearest one found walking up to the repository root, else defaults) |
 | `--format text\|json\|github\|sarif` | Report format (default `text`) |
 | `--severity error\|warning\|info` | Minimum severity to print |
 | `--no-color` | Disable ANSI color (`NO_COLOR` also works) |
@@ -73,8 +73,9 @@ codesnake config -o .codesnake.json
 | `--staged` | Check `git diff --cached` Python files only |
 | `--baseline FILE` | Hide issues whose fingerprint is already in the baseline |
 | `--update-baseline FILE` | Write the current finding set as a baseline |
+| `-j`, `--jobs N` | Worker processes (default: auto — one per CPU once 8+ files are checked; `1` disables) |
 
-`--staged` needs no file arguments and works from any directory inside the repository (paths from git are resolved against the repo root). With no staged `.py` files it exits **0**. `--baseline` fingerprints are `filename|code|message`, so line-only edits do not re-fail CI. A missing baseline file fails closed (exit 1).
+`--staged` needs no file arguments and works from any directory inside the repository (paths from git are resolved against the repo root). With no staged `.py` files it exits **0**. `--baseline` fingerprints are `filename|code|message-with-numbers-normalized|occurrence`, so line-only edits and count changes (`52 lines long` → `53 lines long`) do not re-fail CI, while a *second* identical violation in the same file still does. Version-1 baselines are read transparently; `--update-baseline` writes version 2. A missing baseline file fails closed (exit 1).
 
 ### Output formats
 
@@ -82,8 +83,8 @@ codesnake config -o .codesnake.json
 |---|---|
 | `text` (default) | Human-readable; color when stdout is a TTY; includes a one-line suggestion |
 | `json` | Per-file issues plus a summary (`end_line`, `end_col`, `suggestion`, `source`) |
-| `github` | GitHub Actions commands (`::error file=...,line=...,endLine=...`) |
-| `sarif` | SARIF 2.1.0 regions for security dashboards |
+| `github` | GitHub Actions workflow commands (`::error file=...,line=...,col=...,title=...::message`), properly `%`-escaped |
+| `sarif` | SARIF 2.1.0 with rule metadata (`helpUri`, default level, suggestion) and repo-relative URIs for code-scanning dashboards |
 
 ### Exit codes
 
@@ -100,7 +101,7 @@ Missing files, empty directories, and decode failures are **IO001**. Syntax erro
 | Code | Severity | What |
 |---|---|---|
 | **SEC001** | info / error | `eval()` / `exec()` — **info** on a constant, **error** on untrusted input |
-| **SEC002** | warning | `pickle.loads` / `pickle.load` |
+| **SEC002** | warning | Unsafe deserialization: `pickle` / `dill` / `cloudpickle` / `jsonpickle` loads, `pickle.Unpickler(...).load()`, `marshal.load(s)`, `shelve.open`, and `yaml.load` without a safe `Loader` |
 | **SEC003** | warning / error | `subprocess` with `shell=True`, or `os.system` / `os.popen` / `subprocess.getoutput` (**error** if the command is untrusted) |
 | **SEC004** | warning | `subprocess` command (`run`, `call`, `Popen`, `check_call`, `check_output`) built from untrusted input |
 | **BUG001** | error | Mutable default arguments (`[]`, `{}`, `set()`, `list()`, kw-only, `lambda`, `async def`) |
@@ -153,7 +154,14 @@ import os            # codesnake: ignore=IMP002
 
 ## Configuration
 
-If `.codesnake.json` exists in the current directory, it is loaded automatically. `--config PATH` overrides that. Thresholds in the JSON are the source of truth.
+CodeSnake looks for configuration starting in the current directory and walking up to the repository root (the first directory containing `.git`). In each directory a `.codesnake.json` wins over a `pyproject.toml` `[tool.codesnake]` table. `--config PATH` (JSON or TOML) overrides discovery.
+
+```toml
+# pyproject.toml — same keys as the JSON file (reading TOML needs Python 3.11+)
+[tool.codesnake]
+max_complexity = 8
+check_style = false
+```
 
 ```json
 {
@@ -203,6 +211,10 @@ rc = run_check(
 ```
 
 Each `Issue` includes `line`, `col`, `end_line`, `end_col`, `suggestion`, and `source` (`codesnake` or `bandit`). `col` / `end_col` are **0-based character offsets** (AST byte offsets are converted), and JSON output reports them as-is. The `text`, `github`, and `sarif` formats print **1-based** columns.
+
+## Performance
+
+Files are analyzed in a process pool once there are 8 or more of them (one worker per CPU); pass `--jobs 1` for a strictly sequential run or `--jobs N` to pin the count. Output order is always the input order.
 
 ## Tests
 

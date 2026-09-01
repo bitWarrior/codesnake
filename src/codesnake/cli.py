@@ -25,7 +25,12 @@ _TOP_LEVEL_FLAGS = frozenset({'-h', '--help', '--version', '--banner'})
 def add_check_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Attach the ``check`` options to ``parser`` (shared by every entry point)."""
     parser.add_argument('files', nargs='*', help='Python files or directories to check')
-    parser.add_argument('--config', metavar='PATH', help='Path to a .codesnake.json config')
+    parser.add_argument(
+        '--config',
+        metavar='PATH',
+        help='Config file: .codesnake.json or a pyproject.toml with [tool.codesnake] '
+             '(default: nearest one found walking up to the repository root)',
+    )
     parser.add_argument(
         '--format',
         choices=OUTPUT_FORMATS,
@@ -57,6 +62,13 @@ def add_check_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         '--update-baseline',
         metavar='FILE',
         help='Write current findings to a baseline JSON file',
+    )
+    parser.add_argument(
+        '-j',
+        '--jobs',
+        type=int,
+        metavar='N',
+        help='Worker processes (default: auto - one per CPU when checking 8+ files; 1 disables)',
     )
     return parser
 
@@ -121,6 +133,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             staged=args.staged,
             baseline_path=args.baseline,
             update_baseline=args.update_baseline,
+            jobs=args.jobs,
         )
 
     if args.command == 'config':
