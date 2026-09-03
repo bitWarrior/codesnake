@@ -6,6 +6,11 @@ All notable changes to CodeSnake are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-03
+
+A security fix for anyone using CodeSnake as a CI gate. Upgrade if you run it against
+pull requests you do not control.
+
 ### Fixed
 
 - **`.gitignore` no longer hides committed files from a directory walk.** git's own
@@ -128,7 +133,8 @@ A correctness, precision, and packaging release. 189 tests, up from 91.
 - Version single-sourced from `codesnake/_version.py`.
 - MIT `LICENSE` added, with PEP 639 metadata; CI on Python 3.10 through 3.13.
 
-[Unreleased]: https://github.com/bitWarrior/codesnake/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/bitWarrior/codesnake/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/bitWarrior/codesnake/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/bitWarrior/codesnake/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/bitWarrior/codesnake/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bitWarrior/codesnake/releases/tag/v1.1.0
