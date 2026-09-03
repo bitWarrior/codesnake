@@ -34,6 +34,8 @@ Two places reach outside the process, both only when you ask:
 
 Directory walks skip `.gitignore` matches, but **only for files git does not track** — matching git's own rule that an ignore pattern has no effect on a committed file. A file added with `git add -f` is therefore still analyzed, and so is a tracked file inside an ignored directory. `--no-ignore` disables ignore handling entirely, for scanning a working tree that is not a git repository or whose ignored output you want covered. Venvs, caches, and `.git` are skipped in every mode.
 
+A directory walk does not follow a `.py` symlink out of the tree being scanned. `src/x.py -> ~/.ssh/id_rsa` is skipped rather than read, because a parse failure prints the offending source line into the report. Symlinks that resolve inside the scan root are followed normally. An explicit file argument is still read as given — naming a file is a deliberate act.
+
 ### In scope
 
 - Anything that makes CodeSnake execute code from a file it is analyzing

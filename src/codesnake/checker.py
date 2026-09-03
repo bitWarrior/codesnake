@@ -432,6 +432,19 @@ def issue_ignored_by_pragma(code: str, line: int, source_lines: Sequence[str]) -
     return code.upper() in codes
 
 
+def _within(path: Path, root: Path) -> bool:
+    """True if ``path`` resolves to somewhere inside ``root``.
+
+    Reading through a symlink that leaves the tree the caller asked to scan
+    discloses files outside it, so the walk declines to follow one.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved == root or resolved.is_relative_to(root)
+
+
 def _load_ignore_state(
     root_resolved: Path,
 ) -> Tuple['_IgnoreStack', Set[Path], Set[Path]]:
@@ -511,6 +524,12 @@ def iter_python_files(root: Path, *, respect_gitignore: bool = True) -> Iterable
             if not name.endswith('.py'):
                 continue
             candidate = current / name
+            # os.walk does not follow directory symlinks, but a *file* symlink is
+            # yielded and would be read through. `src/x.py -> ~/.ssh/id_rsa` would
+            # otherwise be opened, and a syntax error prints the offending line
+            # into the report. Only follow links that stay inside the scan root.
+            if candidate.is_symlink() and not _within(candidate, root_resolved):
+                continue
             if (
                 respect_gitignore
                 and candidate not in tracked
