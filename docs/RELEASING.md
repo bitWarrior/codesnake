@@ -48,7 +48,15 @@ The build job refuses to publish when the release tag and `_version.py` disagree
 ## What protects the release path
 
 - **Trusted Publishing** — no long-lived credential exists to steal.
-- **The `pypi` environment** — deployments are restricted to `v*` tags, and the publish job is the only thing granted `id-token: write`.
+- **The tagged commit must be on `main`.** Branch protection governs `main`, not tags, so
+  without this anyone able to push a tag and publish a Release could ship a commit that
+  never passed review — the version guard only checks the number, not the history. The
+  build refuses a tag that is not reachable from `main`.
+- **Release tags are immutable** — a ruleset blocks deleting or force-updating `v*`, so a
+  published tag cannot be repointed at different code after the fact.
+- **The `pypi` environment** — deployments are restricted to `v*` tags, the publish job is
+  the only thing granted `id-token: write`, and approval is required with
+  `can_admins_bypass` off, so the wait applies to the owner too.
 - **Split jobs** — the build job has `contents: read` and no OIDC; the publish job has OIDC and never checks out the repository. Code from the repo and the ability to publish never sit in the same job.
 - **Pinned actions** — every action is pinned to a commit SHA, not a mutable tag.
 

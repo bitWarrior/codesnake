@@ -6,6 +6,16 @@ All notable changes to CodeSnake are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **The release workflow refuses a tag that is not reachable from `main`.** Branch
+  protection governs `main`, not tags, so anyone able to push a tag and publish a
+  GitHub Release could previously ship a commit that never passed review — the
+  existing guard compared the tag to `_version.py` and said nothing about history.
+  Paired with a repository ruleset that blocks deleting or force-updating `v*` tags,
+  and `can_admins_bypass` turned off on the `pypi` environment so the approval applies
+  to the owner as well.
+
 ## [1.3.0] - 2026-09-03
 
 A security fix for anyone using CodeSnake as a CI gate. Upgrade if you run it against
