@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/bitWarrior/codesnake/main/images/codesnake-logo.jpg"
+       alt="CodeSnake — semantic analysis for Python" width="640">
+</p>
+
 # CodeSnake
 
 [![CI](https://github.com/bitWarrior/codesnake/actions/workflows/ci.yml/badge.svg)](https://github.com/bitWarrior/codesnake/actions/workflows/ci.yml)
