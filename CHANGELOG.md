@@ -8,6 +8,16 @@ All notable changes to CodeSnake are documented here. The format follows
 
 ### Security
 
+- **A directory walk no longer follows a `.py` symlink out of the scan root.**
+  `os.walk` does not follow directory symlinks, but a *file* symlink was yielded and
+  read through, so `src/x.py -> ~/.ssh/id_rsa` was opened when scanning `src/`. Worse
+  than the read itself, a syntax error prints the offending source line into the
+  report, so a line of the target file reached the output — and on a public repository,
+  the CI log. Symlinks resolving inside the root are still followed; an explicit file
+  argument is still read as given.
+
+### Security
+
 - **The release workflow refuses a tag that is not reachable from `main`.** Branch
   protection governs `main`, not tags, so anyone able to push a tag and publish a
   GitHub Release could previously ship a commit that never passed review — the

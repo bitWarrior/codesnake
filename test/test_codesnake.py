@@ -881,6 +881,64 @@ class TestDirectoryWalkAndEncoding(unittest.TestCase):
         import subprocess
         subprocess.run(['git', *args], cwd=root, check=True, capture_output=True, timeout=30)
 
+    def test_symlink_escaping_the_root_is_not_followed(self):
+        """`src/x.py -> /outside/secret` must not be read.
+
+        os.walk does not follow directory symlinks, but a file symlink is
+        yielded and would be read through, and a syntax error prints the
+        offending line into the report.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / 'project' / 'src').mkdir(parents=True)
+            outside = root / 'outside'
+            outside.mkdir()
+            secret = outside / 'secret.txt'
+            secret.write_text('DB_PASSWORD = hunter2!$nope\n', encoding='utf-8')
+            (root / 'project' / 'src' / 'real.py').write_text('x = 1\n', encoding='utf-8')
+            try:
+                (root / 'project' / 'src' / 'leaked.py').symlink_to(secret)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks unavailable')
+
+            targets, _ = expand_python_targets([str(root / 'project' / 'src')])
+            self.assertEqual({Path(t).name for t in targets}, {'real.py'})
+
+    def test_symlink_staying_inside_the_root_is_followed(self):
+        """Containment, not a blanket ban on symlinks."""
+        from codesnake.checker import iter_python_files
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / 'src' / 'pkg').mkdir(parents=True)
+            target = root / 'src' / 'pkg' / 'shared.py'
+            target.write_text('x = 1\n', encoding='utf-8')
+            try:
+                (root / 'src' / 'alias.py').symlink_to(target)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks unavailable')
+
+            found = {p.name for p in iter_python_files(root / 'src')}
+            self.assertEqual(found, {'shared.py', 'alias.py'})
+
+    def test_escaping_symlink_content_never_reaches_the_report(self):
+        """The disclosure that made this worth fixing: the source line is printed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / 'project' / 'src').mkdir(parents=True)
+            secret = root / 'secret.env'
+            secret.write_text('DEBUG = False\nDB_PASSWORD = hunter2!$nope\n', encoding='utf-8')
+            (root / 'project' / 'src' / 'ok.py').write_text('x = 1\n', encoding='utf-8')
+            try:
+                (root / 'project' / 'src' / 'config.py').symlink_to(secret)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks unavailable')
+
+            out = StringIO()
+            run_check([str(root / 'project' / 'src')], stream=out,
+                      color=False, show_banner=False)
+            self.assertNotIn('DB_PASSWORD', out.getvalue())
+            self.assertNotIn('hunter2', out.getvalue())
+
     def test_committed_file_is_not_hidden_by_gitignore(self):
         """git ignores .gitignore for tracked files; so must the walk.
 
