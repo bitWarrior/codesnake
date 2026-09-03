@@ -37,7 +37,7 @@ codesnake/
 
 | Module | Contents |
 |---|---|
-| `checker.py` | `SemanticChecker` (the AST visitor and every rule), `CheckerConfig` / `load_config`, file discovery (`iter_python_files`, `.gitignore` handling, `expand_python_targets`), `check_file`, bandit merge, baselines, `--staged` support, the four report formatters, and `run_check` (the orchestration entry point used by the CLI and by library callers) |
+| `checker.py` | `SemanticChecker` (the AST visitor and every rule), `CheckerConfig` / `load_config`, file discovery (`iter_python_files`, `.gitignore` handling, `--no-ignore` / `respect_gitignore`, `expand_python_targets`), `check_file`, bandit merge, baselines, `--staged` support, the four report formatters, and `run_check` (the orchestration entry point used by the CLI and by library callers) |
 | `cli.py` | `add_check_arguments()` (the single definition of the `check` flags), `build_parser()`, `normalize_argv()` (so `codesnake FILES` means `codesnake check FILES`), and `main()` |
 | `banner.py` | `print_snake_banner()`, `print_version()`; `VERSION` is imported from `_version` |
 | `_version.py` | `__version__` — read statically by `pyproject.toml` (`dynamic = ["version"]`) |

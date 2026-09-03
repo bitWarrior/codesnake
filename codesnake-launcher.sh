@@ -46,8 +46,8 @@ Options:
     --test                  Run test suite
     --banner                Show CodeSnake banner
 
-Any other argument (files, directories, --bandit, --staged, --baseline FILE,
---no-color, ...) is passed straight through to CodeSnake.
+Any other argument (files, directories, --bandit, --staged, --no-ignore,
+--baseline FILE, --no-color, ...) is passed straight through to CodeSnake.
 
 Examples:
     $0 mycode.py                           # Check a file

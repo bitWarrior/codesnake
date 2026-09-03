@@ -6,6 +6,24 @@ All notable changes to CodeSnake are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`.gitignore` no longer hides committed files from a directory walk.** git's own
+  rule is that an ignore pattern has no effect on a tracked file; CodeSnake applied
+  it regardless, so a pull request could add a file, ignore it, `git add -f` it, and
+  `codesnake check src/` would never see it — exiting 0 with the file in the tree.
+  Tracked files are now exempt from ignore filtering, and an ignored directory
+  holding a tracked file is walked rather than pruned. Untracked ignored files, such
+  as generated output, are still skipped. No flag is needed, and CI gates written
+  before this release are covered on upgrade.
+
+### Added
+
+- **`--no-ignore`** disables `.gitignore` handling entirely, covering *untracked*
+  ignored files as well — useful for linting generated code or scanning a tree that
+  is not a git repository. Venvs, caches, and `.git` stay skipped. Explicit file
+  arguments were never gitignore-filtered.
+
 ## [1.2.1] - 2026-09-01
 
 First release published to PyPI. The package itself is byte-identical to 1.2.0 —

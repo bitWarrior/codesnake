@@ -46,6 +46,20 @@ To have pre-commit manage the install instead, use `language: python` with
 
 ## GitHub Actions
 
+`.gitignore` is applied only to files git does not track, matching git's own rule that an ignore pattern has no effect on a committed file. A file added with `git add -f`, or a tracked file inside an ignored directory, is analyzed by a plain `codesnake check src/` — no flag required. This is what stops a pull request from hiding code from the gate by ignoring it and force-adding it.
+
+Two variations are still useful:
+
+```bash
+# Also cover UNTRACKED ignored files, e.g. generated code you want linted anyway
+codesnake check --no-ignore --severity error --no-color src/
+
+# Exactly what git tracks, and nothing else
+codesnake check --no-color --severity error $(git ls-files '*.py')
+```
+
+Run the `git ls-files` form from the repository root. If it expands to nothing, CodeSnake exits 2 (`no files to check`); the directory form does not have that empty-tree edge.
+
 ### Inline annotations
 
 `--format github` prints workflow commands; GitHub turns them into annotations on the PR diff. This repository's own `.github/workflows/ci.yml` does exactly this.
@@ -80,7 +94,7 @@ Upload SARIF so findings appear under **Security → Code scanning**. The `|| tr
       - uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: codesnake.sarif
-      - run: codesnake check --severity error --no-color src/
+      - run: codesnake check --severity error --no-color --no-ignore src/
 ```
 
 ### Only fail on new findings
@@ -95,7 +109,7 @@ git add .codesnake-baseline.json
 Baselines store paths relative to the working directory, so write and read them from the **same** directory — the repository root, to match CI. A baseline recorded at the root suppresses nothing when the check is later run from inside `src/`. (This is why `--baseline` does not belong in the `--staged` hook above without pinning the directory first.)
 
 ```yaml
-      - run: codesnake check --baseline .codesnake-baseline.json --format github --no-color src/
+      - run: codesnake check --baseline .codesnake-baseline.json --format github --no-color --no-ignore src/
 ```
 
 A fingerprint is the file path, the rule code, the message with digits normalized away, and an occurrence index. Line numbers and numeric counts therefore do not matter — edits above a finding, or a complexity score drifting from 15 to 16, will not re-fail CI. Anything else does: moving code to another file, or a rename that changes an identifier quoted in the message (`Unused import 'os'`), mints a new fingerprint even though the finding is unchanged. A genuinely *new* violation (including a second identical one in the same file) fails too. Refresh the baseline with `--update-baseline` as you pay down the backlog.
@@ -159,7 +173,7 @@ lint:            ## everything, human-readable
 	codesnake check src/ test/
 
 lint-errors:     ## only what would fail CI
-	codesnake check --severity error src/
+	codesnake check --severity error --no-ignore src/
 
 lint-baseline:   ## only findings not in the committed baseline
 	codesnake check --baseline .codesnake-baseline.json src/
@@ -194,7 +208,8 @@ CodeSnake's differentiators are the taint tracking behind SEC001/SEC003 severiti
 | Symptom | Fix |
 |---|---|
 | Too many findings | Baseline first, then tune thresholds and `check_*` flags; `# noqa: CODE` for the rest |
-| Slow on a large tree | `--jobs N` (auto-parallel from 8 files); point at specific directories; generated code under `.gitignore`d directories is already skipped |
+| Slow on a large tree | `--jobs N` (auto-parallel from 8 files); point at specific directories; untracked generated code under `.gitignore`d directories is skipped unless you pass `--no-ignore` |
+| CI missed a committed file | Tracked files are never hidden by `.gitignore`. If one was missed it is untracked — commit it, or pass `--no-ignore` |
 | `No staged Python files.` | Nothing staged, or the files are not `*.py`; a real git failure prints an `Error:` instead |
 | Escape codes in CI logs | `--no-color` or `NO_COLOR=1` |
 | Warnings don't fail the build | By design; see the exit-code note at the top |

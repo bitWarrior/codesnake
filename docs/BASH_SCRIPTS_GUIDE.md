@@ -58,7 +58,7 @@ Activates `codesnake-venv/` (creating and populating it on first run), then `exe
 | `--banner` | Print the banner |
 | `-e`, `--enhanced` | Deprecated no-op (the "enhanced" checker was merged into the main CLI) |
 
-Anything else — files, directories, `--bandit`, `--staged`, `--baseline FILE`, `--update-baseline FILE`, `--jobs N`, `--no-color` — is passed straight through to `codesnake check`. Arguments are forwarded as an array, so paths with spaces or shell metacharacters are safe. An option that needs a value but has none exits with status 2 and a message.
+Anything else — files, directories, `--bandit`, `--staged`, `--no-ignore`, `--baseline FILE`, `--update-baseline FILE`, `--jobs N`, `--no-color` — is passed straight through to `codesnake check`. Arguments are forwarded as an array, so paths with spaces or shell metacharacters are safe. An option that needs a value but has none exits with status 2 and a message.
 
 ```bash
 ./codesnake-launcher.sh mycode.py
