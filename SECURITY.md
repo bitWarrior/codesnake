@@ -32,6 +32,8 @@ Two places reach outside the process, both only when you ask:
 - `--bandit` runs the separate `bandit` executable, if it is installed and on `PATH`, over the files you named. That is a different project with its own dependencies and its own threat model.
 - `--staged` runs `git rev-parse` and `git diff --cached` to list staged files.
 
+Directory walks skip `.gitignore` matches, but **only for files git does not track** — matching git's own rule that an ignore pattern has no effect on a committed file. A file added with `git add -f` is therefore still analyzed, and so is a tracked file inside an ignored directory. `--no-ignore` disables ignore handling entirely, for scanning a working tree that is not a git repository or whose ignored output you want covered. Venvs, caches, and `.git` are skipped in every mode.
+
 ### In scope
 
 - Anything that makes CodeSnake execute code from a file it is analyzing

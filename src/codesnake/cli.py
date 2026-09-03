@@ -55,6 +55,12 @@ def add_check_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         help='Check only Python files staged in git',
     )
     parser.add_argument(
+        '--no-ignore',
+        action='store_true',
+        help='Do not skip .gitignore matches when walking directories '
+             '(venvs, caches, and .git are still skipped)',
+    )
+    parser.add_argument(
         '--baseline',
         metavar='FILE',
         help='Ignore issues listed in this baseline JSON file',
@@ -141,6 +147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             baseline_path=args.baseline,
             update_baseline=args.update_baseline,
             jobs=args.jobs,
+            no_ignore=args.no_ignore,
         )
 
     if args.command == 'config':

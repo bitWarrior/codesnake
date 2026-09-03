@@ -70,9 +70,12 @@ adoption path is in [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md#adopting-codesna
 ## Usage
 
 ```bash
-# Files or directories (walks *.py, skips venvs, caches, and .gitignore)
+# Files or directories (walks *.py; skips venvs, caches, and untracked .gitignore matches)
 codesnake check src/codesnake/checker.py test/example_bad_code.py
 codesnake check src/
+
+# Also analyze untracked files that .gitignore hides, e.g. generated output
+codesnake check --no-ignore src/
 
 # Same thing without the subcommand
 codesnake src/
@@ -110,11 +113,12 @@ codesnake config -o .codesnake.json
 | `--no-color` | Disable ANSI color (`NO_COLOR` also works) |
 | `--bandit` | Merge Bandit results when the `bandit` executable is installed |
 | `--staged` | Check `git diff --cached` Python files only |
+| `--no-ignore` | When walking directories, ignore `.gitignore` entirely, including for untracked files (venvs, caches, and `.git` are still skipped). Tracked files are analyzed either way. |
 | `--baseline FILE` | Hide issues whose fingerprint is already in the baseline |
 | `--update-baseline FILE` | Write the current finding set as a baseline |
 | `-j`, `--jobs N` | Worker processes (default: auto — one per CPU once 8+ files are checked; `1` disables) |
 
-`--staged` needs no file arguments and works from any directory inside the repository (paths from git are resolved against the repo root). With no staged `.py` files it exits **0**. `--baseline` fingerprints are `filename|code|message-with-numbers-normalized|occurrence`, so line-only edits and count changes (`52 lines long` → `53 lines long`) do not re-fail CI, while a *second* identical violation in the same file still does. Version-1 baselines are read transparently; `--update-baseline` writes version 2. A missing baseline file fails closed (exit 1).
+`--staged` needs no file arguments and works from any directory inside the repository (paths from git are resolved against the repo root). With no staged `.py` files it exits **0**. Directory walks skip `.gitignore` matches only for files git does not track, mirroring git's own behavior — so a file committed with `git add -f` is still analyzed, and no flag is needed to catch it. `--no-ignore` additionally covers *untracked* ignored files, such as generated output. `--baseline` fingerprints are `filename|code|message-with-numbers-normalized|occurrence`, so line-only edits and count changes (`52 lines long` → `53 lines long`) do not re-fail CI, while a *second* identical violation in the same file still does. Version-1 baselines are read transparently; `--update-baseline` writes version 2. A missing baseline file fails closed (exit 1).
 
 ### Output formats
 

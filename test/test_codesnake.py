@@ -864,6 +864,138 @@ class TestDirectoryWalkAndEncoding(unittest.TestCase):
             names = {Path(path).name for path in targets}
             self.assertEqual(names, {'kept.py'})
 
+    def _git_repo(self, tmp):
+        """A real git repo; skip if git is unavailable."""
+        import subprocess
+        root = Path(tmp).resolve()
+        try:
+            for cmd in (['git', 'init', '-q', '.'],
+                        ['git', 'config', 'user.email', 't@e.st'],
+                        ['git', 'config', 'user.name', 'test']):
+                subprocess.run(cmd, cwd=root, check=True, capture_output=True, timeout=30)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            self.skipTest('git not available')
+        return root
+
+    def _git(self, root, *args):
+        import subprocess
+        subprocess.run(['git', *args], cwd=root, check=True, capture_output=True, timeout=30)
+
+    def test_committed_file_is_not_hidden_by_gitignore(self):
+        """git ignores .gitignore for tracked files; so must the walk.
+
+        Otherwise a PR can add a file, gitignore it, `git add -f` it, and the
+        default directory walk never sees it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._git_repo(tmp)
+            (root / 'src').mkdir()
+            (root / 'src' / 'good.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'src' / 'evil.py').write_text('eval(input())\n', encoding='utf-8')
+            (root / '.gitignore').write_text('src/evil.py\n', encoding='utf-8')
+            self._git(root, 'add', '.gitignore', 'src/good.py')
+            self._git(root, 'add', '-f', 'src/evil.py')
+            self._git(root, 'commit', '-q', '-m', 'x')
+
+            targets, _ = expand_python_targets([str(root / 'src')])
+            self.assertEqual({Path(t).name for t in targets}, {'good.py', 'evil.py'})
+
+    def test_committed_file_inside_ignored_directory_is_walked(self):
+        """An ignored directory holding a tracked file must not be pruned."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._git_repo(tmp)
+            (root / 'src' / 'hidden').mkdir(parents=True)
+            (root / 'src' / 'good.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'src' / 'hidden' / 'evil.py').write_text('eval(input())\n', encoding='utf-8')
+            (root / '.gitignore').write_text('src/hidden/\n', encoding='utf-8')
+            self._git(root, 'add', '.gitignore', 'src/good.py')
+            self._git(root, 'add', '-f', 'src/hidden/evil.py')
+            self._git(root, 'commit', '-q', '-m', 'x')
+
+            targets, _ = expand_python_targets([str(root / 'src')])
+            self.assertEqual({Path(t).name for t in targets}, {'good.py', 'evil.py'})
+
+    def test_untracked_gitignored_files_are_still_skipped(self):
+        """The exemption is for tracked files only — build output stays ignored."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._git_repo(tmp)
+            (root / 'src' / 'build').mkdir(parents=True)
+            (root / 'src' / 'good.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'src' / 'generated.py').write_text('eval(input())\n', encoding='utf-8')
+            (root / 'src' / 'build' / 'gen.py').write_text('eval(input())\n', encoding='utf-8')
+            (root / '.gitignore').write_text('src/generated.py\nsrc/build/\n', encoding='utf-8')
+            self._git(root, 'add', '.gitignore', 'src/good.py')
+            self._git(root, 'commit', '-q', '-m', 'x')
+
+            targets, _ = expand_python_targets([str(root / 'src')])
+            self.assertEqual({Path(t).name for t in targets}, {'good.py'})
+
+    def test_no_ignore_includes_gitignored_files(self):
+        """A committed-but-ignored file must be visible to a CI directory walk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '.gitignore').write_text('ignored.py\nsecret/\n', encoding='utf-8')
+            (root / 'kept.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'ignored.py').write_text('eval(1)\n', encoding='utf-8')
+            (root / 'secret').mkdir()
+            (root / 'secret' / 'bad.py').write_text('eval(1)\n', encoding='utf-8')
+            targets, extras = expand_python_targets(
+                [str(root)], respect_gitignore=False,
+            )
+            self.assertEqual(extras, [])
+            names = {Path(path).name for path in targets}
+            self.assertEqual(names, {'kept.py', 'ignored.py', 'bad.py'})
+
+    def test_no_ignore_still_skips_venvs_and_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'kept.py').write_text('x = 1\n', encoding='utf-8')
+            (root / '__pycache__').mkdir()
+            (root / '__pycache__' / 'skip.py').write_text('eval(1)\n', encoding='utf-8')
+            (root / '.venv').mkdir()
+            (root / '.venv' / 'lib.py').write_text('eval(1)\n', encoding='utf-8')
+            targets, extras = expand_python_targets(
+                [str(root)], respect_gitignore=False,
+            )
+            self.assertEqual(extras, [])
+            self.assertEqual([Path(path).name for path in targets], ['kept.py'])
+
+    def test_run_check_no_ignore_reports_gitignored_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '.gitignore').write_text('evil.py\n', encoding='utf-8')
+            (root / 'ok.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'evil.py').write_text('eval(input())\n', encoding='utf-8')
+            skipped = StringIO()
+            self.assertEqual(
+                run_check(
+                    [str(root)],
+                    config=CheckerConfig(),
+                    output_format='json',
+                    show_banner=False,
+                    color=False,
+                    stream=skipped,
+                ),
+                0,
+            )
+            found = StringIO()
+            rc = run_check(
+                [str(root)],
+                config=CheckerConfig(),
+                output_format='json',
+                show_banner=False,
+                color=False,
+                stream=found,
+                no_ignore=True,
+            )
+            self.assertEqual(rc, 1)
+            codes = [
+                issue['code']
+                for file_report in json.loads(found.getvalue())['files']
+                for issue in file_report['issues']
+            ]
+            self.assertIn('SEC001', codes)
+
     def test_run_check_on_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2116,6 +2248,27 @@ class TestPackageAndCli(unittest.TestCase):
             self.assertEqual(main(['check']), 2)
         self.assertIn('provide files', err.getvalue())
 
+    def test_cli_no_ignore_checks_gitignored_file(self):
+        from unittest.mock import patch
+        from codesnake.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '.gitignore').write_text('evil.py\n', encoding='utf-8')
+            (root / 'ok.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'evil.py').write_text('eval(input())\n', encoding='utf-8')
+            with patch('sys.stdout', StringIO()):
+                self.assertEqual(
+                    main(['check', str(root), '--format', 'json', '--no-color']),
+                    0,
+                )
+            with patch('sys.stdout', StringIO()) as out:
+                rc = main([
+                    'check', str(root), '--format', 'json', '--no-color',
+                    '--no-ignore',
+                ])
+            self.assertEqual(rc, 1)
+            self.assertIn('SEC001', out.getvalue())
+
     def test_deeply_nested_file_is_contained_not_fatal(self):
         """One unanalyzable file must not sink the whole run."""
         from codesnake import check_file, run_check
@@ -2349,6 +2502,24 @@ class TestGitignoreFromRepoRoot(unittest.TestCase):
             (outer / 'proj' / 'a.py').write_text('x = 1\n', encoding='utf-8')
             targets, _ = expand_python_targets([str(outer / 'proj')])
             self.assertEqual({Path(t).name for t in targets}, {'a.py'})
+
+    def test_no_ignore_includes_root_gitignored_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / '.git').mkdir()
+            (root / '.gitignore').write_text('generated/\n*_pb2.py\n', encoding='utf-8')
+            src = root / 'src'
+            (src / 'generated').mkdir(parents=True)
+            (src / 'a.py').write_text('x = 1\n', encoding='utf-8')
+            (src / 'proto_pb2.py').write_text('x = 1\n', encoding='utf-8')
+            (src / 'generated' / 'g.py').write_text('x = 1\n', encoding='utf-8')
+            targets, _ = expand_python_targets(
+                [str(src)], respect_gitignore=False,
+            )
+            self.assertEqual(
+                {Path(t).name for t in targets},
+                {'a.py', 'proto_pb2.py', 'g.py'},
+            )
 
 
 class TestBaselineFingerprints(unittest.TestCase):

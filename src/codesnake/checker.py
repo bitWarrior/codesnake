@@ -360,6 +360,34 @@ def find_repo_root(start: Path) -> Optional[Path]:
     return None
 
 
+def git_tracked_files(repo_root: Path) -> Set[Path]:
+    """Resolved paths of every file git tracks in ``repo_root``, or an empty set.
+
+    git's own rule is that ``.gitignore`` governs *untracked* files only -- a
+    file that is committed is not affected by an ignore rule matching it. A
+    scanner that filters tracked files by ``.gitignore`` therefore diverges
+    from git, and can be made to skip a committed file with ``git add -f``.
+    Failure here (no git, not a repository, a timeout) yields an empty set,
+    which restores the previous behavior rather than hiding files.
+    """
+    try:
+        completed = _subprocess.run(
+            ['git', 'ls-files', '-z', '--full-name'],
+            capture_output=True,
+            timeout=30,
+            cwd=str(repo_root),
+        )
+    except (OSError, _subprocess.TimeoutExpired):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    tracked: Set[Path] = set()
+    for name in completed.stdout.decode('utf-8', errors='replace').split('\0'):
+        if name:
+            tracked.add(repo_root / name)
+    return tracked
+
+
 def detect_source_encoding(data: bytes) -> str:
     """PEP 263 encoding cookie, else UTF-8 (with BOM)."""
     if data.startswith(b'\xef\xbb\xbf'):
@@ -404,12 +432,15 @@ def issue_ignored_by_pragma(code: str, line: int, source_lines: Sequence[str]) -
     return code.upper() in codes
 
 
-def iter_python_files(root: Path) -> Iterable[Path]:
-    """Yield .py files under root, skipping venvs, caches, and .gitignore matches."""
-    try:
-        root_resolved = root.resolve()
-    except OSError:
-        root_resolved = root
+def _load_ignore_state(
+    root_resolved: Path,
+) -> Tuple['_IgnoreStack', Set[Path], Set[Path]]:
+    """Ignore rules for a walk, plus the tracked paths exempt from them.
+
+    Returns the loaded ``.gitignore`` stack, the set of files git tracks, and
+    the directories those files live in. Tracked entries are exempt because
+    git applies ignore rules to untracked files only.
+    """
     ignore = _IgnoreStack()
     # .gitignore files between the repository root and the target apply to
     # everything below them, so load them first (top-most first).
@@ -425,23 +456,68 @@ def iter_python_files(root: Path) -> Iterable[Path]:
         if gi_path.is_file():
             ignore.add_gitignore(gi_path)
 
+    if repo_root is None:
+        return ignore, set(), set()
+    try:
+        tracked = git_tracked_files(repo_root.resolve())
+    except OSError:
+        return ignore, set(), set()
+    # An ignored *directory* holding a committed file must still be walked, or
+    # the file-level exemption is never reached.
+    tracked_dirs: Set[Path] = set()
+    for path in tracked:
+        tracked_dirs.update(path.parents)
+    return ignore, tracked, tracked_dirs
+
+
+def iter_python_files(root: Path, *, respect_gitignore: bool = True) -> Iterable[Path]:
+    """Yield .py files under root, skipping venvs, caches, and (by default) .gitignore matches.
+
+    ``respect_gitignore=False`` still skips ``SKIP_DIR_NAMES`` (venvs, caches,
+    ``.git``, ...) so a CI gate does not have to crawl ``site-packages``. It
+    does not skip a committed file that ``.gitignore`` would hide — pass
+    ``--no-ignore`` for that, or name the file explicitly.
+    """
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        root_resolved = root
+    ignore, tracked, tracked_dirs = (
+        _load_ignore_state(root_resolved) if respect_gitignore
+        else (_IgnoreStack(), set(), set())
+    )
+
     for dirpath, dirnames, filenames in os.walk(root_resolved):
         current = Path(dirpath)
-        nested_gi = current / '.gitignore'
-        if nested_gi.is_file():
-            ignore.add_gitignore(nested_gi)
-        views = ignore.view(current)
+        views: _DirectoryView = []
+        if respect_gitignore:
+            nested_gi = current / '.gitignore'
+            if nested_gi.is_file():
+                ignore.add_gitignore(nested_gi)
+            views = ignore.view(current)
 
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIR_NAMES
             and not name.endswith('.egg-info')
-            and not _IgnoreStack.ignored(views, name, is_dir=True)
+            and not (
+                respect_gitignore
+                and (current / name) not in tracked_dirs
+                and _IgnoreStack.ignored(views, name, is_dir=True)
+            )
         ]
 
         for name in filenames:
-            if name.endswith('.py') and not _IgnoreStack.ignored(views, name, is_dir=False):
-                yield current / name
+            if not name.endswith('.py'):
+                continue
+            candidate = current / name
+            if (
+                respect_gitignore
+                and candidate not in tracked
+                and _IgnoreStack.ignored(views, name, is_dir=False)
+            ):
+                continue
+            yield candidate
 
 
 @dataclass
@@ -2139,7 +2215,11 @@ def git_staged_python_files() -> Tuple[List[str], Optional[str]]:
     return files, None
 
 
-def expand_python_targets(paths: Sequence[str]) -> Tuple[List[str], List[Issue]]:
+def expand_python_targets(
+    paths: Sequence[str],
+    *,
+    respect_gitignore: bool = True,
+) -> Tuple[List[str], List[Issue]]:
     """Expand directories to .py files. Explicit files are kept as given."""
     targets: List[str] = []
     extras: List[Issue] = []
@@ -2160,7 +2240,12 @@ def expand_python_targets(paths: Sequence[str]) -> Tuple[List[str], List[Issue]]
     for raw in paths:
         path = Path(raw)
         if path.is_dir():
-            found = [str(candidate) for candidate in iter_python_files(path)]
+            found = [
+                str(candidate)
+                for candidate in iter_python_files(
+                    path, respect_gitignore=respect_gitignore,
+                )
+            ]
             if not found:
                 extras.append(_io_issue(raw, f"No Python files found in '{raw}'"))
                 continue
@@ -2609,10 +2694,14 @@ def run_check(
     baseline_path: Optional[str] = None,
     update_baseline: Optional[str] = None,
     jobs: Optional[int] = None,
+    no_ignore: bool = False,
 ) -> int:
     """Analyze one or more files. Returns 1 if any error-severity issue exists.
 
     ``jobs``: worker processes (``None``/``0`` = auto, ``1`` = sequential).
+    ``no_ignore``: walk directories without applying ``.gitignore`` (venvs,
+    caches, and ``.git`` are still skipped). Explicit file arguments are
+    never gitignore-filtered.
     """
     out = stream if stream is not None else sys.stdout
 
@@ -2643,7 +2732,9 @@ def run_check(
     if show_banner and output_format == 'text':
         print_snake_banner(use_color=use_color)
 
-    targets, extra_issues = expand_python_targets(file_list)
+    targets, extra_issues = expand_python_targets(
+        file_list, respect_gitignore=not no_ignore,
+    )
 
     file_reports: List[Tuple[str, List[Issue], Optional[str]]] = []
     for extra in extra_issues:
