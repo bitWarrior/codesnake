@@ -6,25 +6,30 @@ All notable changes to CodeSnake are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-03
+
+An information-disclosure fix. Upgrade if you run CodeSnake over trees you do not
+fully control — a pull request, a submitted plugin, a checkout of someone else's code.
+
 ### Security
 
 - **A directory walk no longer follows a `.py` symlink out of the scan root.**
   `os.walk` does not follow directory symlinks, but a *file* symlink was yielded and
   read through, so `src/x.py -> ~/.ssh/id_rsa` was opened when scanning `src/`. Worse
-  than the read itself, a syntax error prints the offending source line into the
-  report, so a line of the target file reached the output — and on a public repository,
-  the CI log. Symlinks resolving inside the root are still followed; an explicit file
-  argument is still read as given.
-
-### Security
+  than the read itself: a parse failure becomes `SYN001` and the text report prints the
+  offending source line, so a line of the target file reached the output — and on a
+  public repository, the CI log. Since the attacker picks the target, they pick which
+  line fails to parse. Symlinks resolving inside the root are still followed, and an
+  explicit file argument is still read as given.
 
 - **The release workflow refuses a tag that is not reachable from `main`.** Branch
   protection governs `main`, not tags, so anyone able to push a tag and publish a
-  GitHub Release could previously ship a commit that never passed review — the
-  existing guard compared the tag to `_version.py` and said nothing about history.
-  Paired with a repository ruleset that blocks deleting or force-updating `v*` tags,
-  and `can_admins_bypass` turned off on the `pypi` environment so the approval applies
-  to the owner as well.
+  GitHub Release could previously ship a commit that never passed review — the existing
+  guard compared the tag to `_version.py` and said nothing about history. Paired with a
+  repository ruleset that blocks deleting or force-updating `v*` tags, and
+  `can_admins_bypass` turned off on the `pypi` environment so the approval applies to
+  the owner as well. This hardens how CodeSnake is released; it does not change the
+  package itself.
 
 ## [1.3.0] - 2026-09-03
 
@@ -153,7 +158,8 @@ A correctness, precision, and packaging release. 189 tests, up from 91.
 - Version single-sourced from `codesnake/_version.py`.
 - MIT `LICENSE` added, with PEP 639 metadata; CI on Python 3.10 through 3.13.
 
-[Unreleased]: https://github.com/bitWarrior/codesnake/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/bitWarrior/codesnake/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/bitWarrior/codesnake/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bitWarrior/codesnake/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/bitWarrior/codesnake/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/bitWarrior/codesnake/compare/v1.1.0...v1.2.0
