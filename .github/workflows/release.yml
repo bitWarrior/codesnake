@@ -25,7 +25,23 @@ jobs:
         with:
           # Build the tag being released, never whatever the default branch is at.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
+          # Full history so the tagged commit can be checked against main below.
+          fetch-depth: 0
           persist-credentials: false
+      - name: Refuse to publish a commit that is not on main
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          # Branch protection governs main, not tags. Without this, anyone who can
+          # push a tag and publish a Release can ship a commit that never passed
+          # review -- the version guard below only checks the number, not the history.
+          git fetch --no-tags --quiet origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$TAG points at $(git rev-parse --short HEAD), which is not reachable from main. Refusing to publish an unreviewed commit."
+            exit 1
+          fi
+          echo "$TAG is on main ($(git rev-parse --short HEAD))"
+
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
